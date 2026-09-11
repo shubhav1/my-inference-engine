@@ -21,11 +21,17 @@ def bytes_to_unicode():
 # tokenizer
 class QwenTokenizer:
     # pre-tokenizer regex used by Qwen's tokenizer.json
-    PAT = regex.compile(r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""")
+    PAT = regex.compile(r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+""")
 
     def __init__(self, model_path):
         with open(f"{model_path}/vocab.json", encoding="utf-8") as f:
             self.encoder = json.load(f)
+
+        with open(f"{model_path}/tokenizer_config.json", encoding="utf-8") as f:
+            added_tokens = json.load(f)["added_tokens_decoder"]
+        for token_id, info in added_tokens.items():
+            self.encoder[info["content"]] = int(token_id)
+
         self.decoder = {i: t for t, i in self.encoder.items()}
 
         with open(f"{model_path}/merges.txt", encoding="utf-8") as f:
