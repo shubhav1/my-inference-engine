@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# qwen model
+cat >> .gitignore << 'EOF'
+qwen2.5-1.5b/
+*.safetensors
+EOF
