@@ -22,6 +22,17 @@ def load_qwen(model_path):
     return model.to(DEVICE)
 
 
+STOP_SEQUENCE = "\nUser:"  # model hallucinating the next turn instead of ending its own
+
+
+def _overlap_len(text, pattern):
+    """Length of the longest suffix of `text` that could still grow into `pattern`."""
+    for k in range(min(len(text), len(pattern) - 1), 0, -1):
+        if text.endswith(pattern[:k]):
+            return k
+    return 0
+
+
 def generate(model, past_cache, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
     input_id = torch.tensor([new_ids], device=DEVICE)
     for _ in range(max_tokens):
@@ -50,22 +61,39 @@ class Chat:
         new_ids = self.tokenizer.encode(f"User: {text}\nAssistant:")
         self.ids.extend(new_ids)
         reply_ids = []
-        reply_text = ""
+        clean_reply = ""
+        buffer = ""  # decoded text held back in case it's the start of STOP_SEQUENCE
 
         for token_id, cache in generate(model, self.cache, new_ids, self.eos_id):
             self.cache = cache
             self.ids.append(token_id)
             reply_ids.append(token_id)
-            reply_text += self.tokenizer.decode([token_id])
-            yield self.tokenizer.decode([token_id])
-            if "\nUser:" in reply_text:  # model started hallucinating the next turn, kill it
+            if token_id == self.eos_id:  # don't display the literal "<|endoftext|>"
                 break
+
+            buffer += self.tokenizer.decode([token_id])
+            if STOP_SEQUENCE in buffer:  # model started hallucinating the next turn, kill it
+                buffer = buffer.split(STOP_SEQUENCE)[0]
+                if buffer:
+                    clean_reply += buffer
+                    yield buffer
+                break
+
+            overlap = _overlap_len(buffer, STOP_SEQUENCE)
+            release, buffer = buffer[:len(buffer) - overlap], buffer[len(buffer) - overlap:]
+            if release:
+                clean_reply += release
+                yield release
+        else:
+            if buffer:  # loop hit max_tokens with a held-back tail that was never a real match
+                clean_reply += buffer
+                yield buffer
 
         trailing = self.tokenizer.encode("\n")
         self.ids.extend(trailing)
         with torch.no_grad():
             _, self.cache = model(torch.tensor([trailing], device=DEVICE), full_past_kv=self.cache)
-        self.messages.append(("assistant", self.tokenizer.decode(reply_ids)))
+        self.messages.append(("assistant", clean_reply))
 
     def send(self, model, text):
         for piece in self.send_stream(model, text):
