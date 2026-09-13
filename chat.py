@@ -5,7 +5,12 @@ from tokenizer import QwenTokenizer
 
 MODEL_PATH = "./qwen2.5-1.5b"
 MAX_REPLY_TOKENS = 512  # safety net against a reply that never hits EOS
-DEVICE = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 
 def load_qwen(model_path):
@@ -17,33 +22,49 @@ def load_qwen(model_path):
     return model.to(DEVICE)
 
 
-def generate(model, ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
+def generate(model, past_cache, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
+    input_id = torch.tensor([new_ids], device=DEVICE)
     for _ in range(max_tokens):
         with torch.no_grad():
-            logits = model(torch.tensor([ids], device=DEVICE))
+            logits, pres_cache = model(input_id, full_past_kv = past_cache)
+        past_cache = pres_cache
         next_id = logits[0, -1].argmax().item()
-        ids.append(next_id)
-        yield next_id
+        yield next_id, pres_cache
         if next_id == eos_id:
             break
+        input_id = torch.tensor([[next_id]], device=DEVICE)
 
 
 class Chat:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.ids = []
+        self.cache = None
         self.messages = []
         self.eos_id = tokenizer.encoder["<|endoftext|>"]
 
     def send_stream(self, model, text):
         """Yield decoded reply pieces as they're generated, updating chat state as it goes."""
+
         self.messages.append(("user", text))
-        self.ids.extend(self.tokenizer.encode(f"User: {text}\nAssistant:"))
+        new_ids = self.tokenizer.encode(f"User: {text}\nAssistant:")
+        self.ids.extend(new_ids)
         reply_ids = []
-        for token_id in generate(model, self.ids, self.eos_id):
+        reply_text = ""
+
+        for token_id, cache in generate(model, self.cache, new_ids, self.eos_id):
+            self.cache = cache
+            self.ids.append(token_id)
             reply_ids.append(token_id)
+            reply_text += self.tokenizer.decode([token_id])
             yield self.tokenizer.decode([token_id])
-        self.ids.extend(self.tokenizer.encode("\n"))
+            if "\nUser:" in reply_text:  # model started hallucinating the next turn, kill it
+                break
+
+        trailing = self.tokenizer.encode("\n")
+        self.ids.extend(trailing)
+        with torch.no_grad():
+            _, self.cache = model(torch.tensor([trailing], device=DEVICE), full_past_kv=self.cache)
         self.messages.append(("assistant", self.tokenizer.decode(reply_ids)))
 
     def send(self, model, text):

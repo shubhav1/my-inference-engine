@@ -74,7 +74,7 @@ class QwenAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=True)
         self.o_proj = torch.nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, past_kv=None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NUM_HEADS, HEAD_DIM).transpose(1, 2)
         k = self.k_proj(x).view(B, T, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
@@ -82,13 +82,21 @@ class QwenAttention(torch.nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
+        # cached kv
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        
+        present_kv = (k, v)
+
         # grouped-query attention (GQA): repeat each kv head for its group of query heads
         k = repeat_kv(k)
         v = repeat_kv(v)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=(past_kv is None))
         out = out.transpose(1, 2).reshape(B, T, NUM_HEADS * HEAD_DIM)
-        return self.o_proj(out)
+        return self.o_proj(out), present_kv
 
 # MLP
 class QwenMLP(torch.nn.Module):
@@ -110,10 +118,11 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+    def forward(self, x, cos, sin, past_kv = None):
+        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
+        x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return x, present_kv
 
 # full Qwen model
 class Qwen2ForCausalLM(torch.nn.Module):
@@ -126,16 +135,25 @@ class Qwen2ForCausalLM(torch.nn.Module):
         inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, HEAD_DIM, 2).float() / HEAD_DIM))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def rope_cos_sin(self, seq_len, device, dtype):
-        t = torch.arange(seq_len, device=device).float()
+    def rope_cos_sin(self, seq_len, past_len, device, dtype):
+        t = torch.arange(past_len, past_len + seq_len, device=device).float()
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None, None].to(dtype), emb.sin()[None, None].to(dtype)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, full_past_kv):
         x = self.embed_tokens(input_ids)
-        cos, sin = self.rope_cos_sin(input_ids.shape[1], x.device, x.dtype)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        past_len = full_past_kv[0][0].shape[2] if full_past_kv is not None else 0
+        cos, sin = self.rope_cos_sin(input_ids.shape[1], past_len, x.device, x.dtype)
+
+        if full_past_kv is None:
+            full_past_kv = [None] * NUM_LAYERS
+
+        full_present_kv = []
+        for layer, past_kv in zip(self.layers, full_past_kv):
+            x, present_kv = layer(x, cos, sin, past_kv)
+            full_present_kv.append(present_kv)
+
         x = self.norm(x)
-        return x @ self.embed_tokens.weight.T
+        logits = x @ self.embed_tokens.weight.T
+        return logits, full_present_kv

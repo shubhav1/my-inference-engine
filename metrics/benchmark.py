@@ -1,38 +1,36 @@
 import os
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # chat.py/tokenizer.py live one level up
 
-from chat import DEVICE, MODEL_PATH, load_qwen
+from chat import DEVICE, MODEL_PATH, generate, load_qwen
 from tokenizer import QwenTokenizer
 
 PROMPT = "Explain what a neural network is in simple terms."
 NUM_TOKENS = 50
-RESULTS_FILE = "results.md"
-
-
-def step(model, input_ids):
-    with torch.no_grad():
-        logits = model(input_ids)
-    next_id = logits[0, -1].argmax().item()  # .item() forces a sync, so timing is accurate on mps
-    return torch.cat([input_ids, torch.tensor([[next_id]], device=DEVICE)], dim=1)
+NO_EOS = -1  # no real token id is negative, so generate() never stops early and always runs NUM_TOKENS steps
+RESULTS_FILE = Path(__file__).resolve().parent / "results.md"
 
 
 def warmup(model, tokenizer):
-    input_ids = torch.tensor([tokenizer.encode(PROMPT)], device=DEVICE)
-    step(model, input_ids)
+    ids = tokenizer.encode(PROMPT)
+    for _ in generate(model, None, ids, NO_EOS, max_tokens=1):
+        pass
 
 
 def run_benchmark(model, tokenizer):
-    input_ids = torch.tensor([tokenizer.encode(PROMPT)], device=DEVICE)
+    ids = tokenizer.encode(PROMPT)
 
     token_times = []
     start = time.perf_counter()
-    for _ in range(NUM_TOKENS):
-        token_start = time.perf_counter()
-        input_ids = step(model, input_ids)
-        token_times.append(time.perf_counter() - token_start)
+    prev = start
+    for _ in generate(model, None, ids, NO_EOS, max_tokens=NUM_TOKENS):
+        now = time.perf_counter()
+        token_times.append(now - prev)
+        prev = now
     total_time = time.perf_counter() - start
 
     ttft = token_times[0]
