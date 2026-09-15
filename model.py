@@ -87,7 +87,7 @@ class QwenAttention(torch.nn.Module):
             past_k, past_v = past_kv
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
-        
+
         present_kv = (k, v)
 
         # grouped-query attention (GQA): repeat each kv head for its group of query heads
@@ -118,7 +118,7 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin, past_kv = None):
+    def forward(self, x, cos, sin, past_kv=None):
         attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
         x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))

@@ -1,12 +1,14 @@
 from html import escape
 from urllib.parse import quote
 
-from flask import Flask, Response, redirect, request, stream_with_context
+import uvicorn
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from chat import Chat, MODEL_PATH, load_qwen
 from tokenizer import QwenTokenizer
 
-app = Flask(__name__)
+app = FastAPI()
 
 print("loading tokenizer and model...")
 tokenizer = QwenTokenizer(MODEL_PATH)
@@ -253,7 +255,7 @@ def chat_tail(name):
 </main>"""
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def index():
     return page(None, """
 <header class="topbar">Select a chat</header>
@@ -262,40 +264,39 @@ def index():
 
 
 @app.post("/new")
-def new_chat():
-    name = request.form["name"].strip()
+def new_chat(name: str = Form(...)):
+    name = name.strip()
     if name and name not in chats:
         chats[name] = Chat(tokenizer)
-    return redirect(f"/chat/{quote(name)}")
+    return RedirectResponse(f"/chat/{quote(name)}", status_code=303)
 
 
-@app.get("/chat/<name>")
-def view_chat(name):
+@app.get("/chat/{name}", response_class=HTMLResponse)
+def view_chat(name: str):
     if name not in chats:
-        return redirect("/")
+        return RedirectResponse("/", status_code=303)
     bubbles = "".join(bubble(role, text) for role, text in chats[name].messages)
     bubbles = bubbles or '<div class="placeholder">Say something to start the conversation.</div>'
     return chat_head(name) + bubbles + chat_tail(name)
 
 
-@app.post("/chat/<name>/clear")
-def clear_chat(name):
+@app.post("/chat/{name}/clear")
+def clear_chat(name: str):
     if name in chats:
         chats[name] = Chat(tokenizer)
-    return redirect(f"/chat/{quote(name)}")
+    return RedirectResponse(f"/chat/{quote(name)}", status_code=303)
 
 
-@app.post("/chat/<name>/delete")
-def delete_chat(name):
+@app.post("/chat/{name}/delete")
+def delete_chat(name: str):
     chats.pop(name, None)
-    return redirect("/")
+    return RedirectResponse("/", status_code=303)
 
 
-@app.post("/chat/<name>/send")
-def send(name):
+@app.post("/chat/{name}/send")
+def send(name: str, message: str = Form(...)):
     if name not in chats:
-        return redirect("/")
-    message = request.form["message"]
+        return RedirectResponse("/", status_code=303)
     chat = chats[name]
     prior = "".join(bubble(role, text) for role, text in chat.messages)
 
@@ -309,8 +310,8 @@ def send(name):
         yield "</div></div>"
         yield chat_tail(name)
 
-    return Response(stream_with_context(stream()), mimetype="text/html")
+    return StreamingResponse(stream(), media_type="text/html")
 
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5050)
+    uvicorn.run(app, host="127.0.0.1", port=5050)  # 5000 collides with macOS AirPlay Receiver
