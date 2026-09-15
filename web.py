@@ -275,9 +275,32 @@ def new_chat(name: str = Form(...)):
 def view_chat(name: str):
     if name not in chats:
         return RedirectResponse("/", status_code=303)
-    bubbles = "".join(bubble(role, text) for role, text in chats[name].messages)
-    bubbles = bubbles or '<div class="placeholder">Say something to start the conversation.</div>'
-    return chat_head(name) + bubbles + chat_tail(name)
+    chat = chats[name]
+
+    catch_up, live_queue = chat.watch()
+    if live_queue is None:
+        bubbles = "".join(bubble(role, text) for role, text in chat.all_messages())
+        bubbles = bubbles or '<div class="placeholder">Say something to start the conversation.</div>'
+        return chat_head(name) + bubbles + chat_tail(name)
+
+    # a reply is actively streaming right now -- join it live instead of a static snapshot
+    prior = "".join(bubble(role, text) for role, text in chat.messages)
+
+    def stream():
+        yield chat_head(name)
+        yield prior
+        yield '<div class="row assistant"><div class="bubble">'
+        yield escape(catch_up)
+        while True:
+            piece = live_queue.get()
+            if piece is None:
+                break
+            yield escape(piece)
+        yield "</div></div>"
+        yield "".join(bubble("user", text) for text in chat.pending)  # any messages queued behind it
+        yield chat_tail(name)
+
+    return StreamingResponse(stream(), media_type="text/html")
 
 
 @app.post("/chat/{name}/clear")
@@ -298,7 +321,7 @@ def send(name: str, message: str = Form(...)):
     if name not in chats:
         return RedirectResponse("/", status_code=303)
     chat = chats[name]
-    prior = "".join(bubble(role, text) for role, text in chat.messages)
+    prior = "".join(bubble(role, text) for role, text in chat.all_messages())
 
     def stream():
         yield chat_head(name)
