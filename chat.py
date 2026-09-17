@@ -2,12 +2,15 @@ import queue
 import threading
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
-from model import Qwen2ForCausalLM
+from model import NUM_LAYERS, Qwen2ForCausalLM
 from tokenizer import QwenTokenizer
 
 MODEL_PATH = "./qwen2.5-1.5b"
 MAX_REPLY_TOKENS = 512  # safety net against a reply that never hits EOS
+TEMPERATURE = 1
+
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 elif torch.backends.mps.is_available():
@@ -58,7 +61,9 @@ def generate(model, past_cache, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
             is_first = False
             logits, pres_cache = model(input_id, full_past_kv=past_cache)
         past_cache = pres_cache
-        next_id = logits[0, -1].argmax().item()
+        # next_id = logits[0, -1].argmax().item()
+        probs = F.softmax(logits[0, -1] / TEMPERATURE, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1).item()
         yield next_id, pres_cache
         if next_id == eos_id:
             break
@@ -70,64 +75,148 @@ class _Job:
         self.model = model
         self.text = text
         self.out_queue = out_queue
+        self.buffer = ""  # decoded text held back in case it's the start of a stop sequence
+        self.steps = 0
+        self.next_token = None  # token most recently produced, to be fed on this job's next decode call
+
+
+def _sample(logit_row):
+    probs = F.softmax(logit_row / TEMPERATURE, dim=-1)
+    return torch.multinomial(probs, num_samples=1).item()
 
 
 _job_queue = queue.Queue()
+active = []
 
 
-def _worker():
-    while True:
-        job = _job_queue.get()
-        _process(job)
+def _admit(job):
+    """Prefill: one forward pass over the whole prompt, explicitly separate from decoding.
 
-
-def _process(job):
-    chat, model, text, out_queue = job.chat, job.model, job.text, job.out_queue
+    Runs once per job, right before it joins `active` and starts sharing decode steps.
+    """
+    chat, model, text = job.chat, job.model, job.text
 
     chat.pending.remove(text)  # this message is now being handled, not just waiting
     chat.messages.append(("user", text))
     new_ids = chat.tokenizer.encode(f"User: {text}\nAssistant:")
     chat.ids.extend(new_ids)
-    chat.listeners = [out_queue]  # set before in_progress: closes the window where watch() could miss it
+    chat.listeners = [job.out_queue]  # set before in_progress: closes the window watch() could miss it
     chat.in_progress = ""  # visible to any page render while this reply is still streaming
-    buffer = ""  # decoded text held back in case it's the start of a stop sequence
 
-    def emit(piece):
-        chat.in_progress += piece
-        for q in chat.listeners:
-            q.put(piece)
+    input_ids = torch.tensor([new_ids], device=DEVICE)
+    with torch.no_grad():
+        logits, cache = model(input_ids, full_past_kv=chat.cache)
+    chat.cache = cache
+    job.next_token = _sample(logits[0, -1])
 
-    for token_id, cache in generate(model, chat.cache, new_ids, chat.eos_id):
-        chat.cache = cache
-        chat.ids.append(token_id)
-        if token_id == chat.eos_id:  # don't display "<|endoftext|>"
-            break
+    active.append(job)
 
-        buffer += chat.tokenizer.decode([token_id])
-        stop = _find_stop(buffer, STOP_SEQUENCES)  # model hallucinating the next turn, kill it
-        if stop is not None:
-            buffer = buffer.split(stop)[0]
-            if buffer:
-                emit(buffer)
-            break
 
-        overlap = _overlap_len(buffer, STOP_SEQUENCES)
-        release, buffer = buffer[:len(buffer) - overlap], buffer[len(buffer) - overlap:]
-        if release:
-            emit(release)
-    else:
-        if buffer:  # loop hit max_tokens with a held-back tail that was never a real match
-            emit(buffer)
+def _emit(job, piece):
+    job.chat.in_progress += piece
+    for q in job.chat.listeners:
+        q.put(piece)
 
+
+def _finish(job):
+    chat = job.chat
     trailing = chat.tokenizer.encode("\n")
     chat.ids.extend(trailing)
     with torch.no_grad():
-        _, chat.cache = model(torch.tensor([trailing], device=DEVICE), full_past_kv=chat.cache)
+        _, chat.cache = job.model(torch.tensor([trailing], device=DEVICE), full_past_kv=chat.cache)
     chat.messages.append(("assistant", chat.in_progress))
     chat.in_progress = None
     for q in chat.listeners:
         q.put(None)
     chat.listeners = []
+    active.remove(job)
+
+
+def _worker():
+    while True:
+        if not active:
+            _admit(_job_queue.get())  # block until at least one request comes in
+        while not _job_queue.empty():
+            _admit(_job_queue.get())  # pick up anything else that's arrived since
+        _process(active)
+
+
+def _process(active):
+    """One decode step for every job currently active, in FIFO order."""
+
+    # for loop for bookkeeping stuff
+    continuing = []
+    for job in list(active):  # snapshot, _finish() removes from `active` as jobs complete
+        chat = job.chat
+        token_id = job.next_token
+        chat.ids.append(token_id)
+
+        if token_id == chat.eos_id:  # don't display "<|endoftext|>"
+            _finish(job)
+            continue
+
+        job.buffer += chat.tokenizer.decode([token_id])
+        stop = _find_stop(job.buffer, STOP_SEQUENCES)  # model hallucinating the next turn, kill it
+        if stop is not None:
+            job.buffer = job.buffer.split(stop)[0]
+            if job.buffer:
+                _emit(job, job.buffer)
+            _finish(job)
+            continue
+
+        overlap = _overlap_len(job.buffer, STOP_SEQUENCES)
+        release, job.buffer = job.buffer[:len(job.buffer) - overlap], job.buffer[len(job.buffer) - overlap:]
+        if release:
+            _emit(job, release)
+
+        job.steps += 1
+        if job.steps >= MAX_REPLY_TOKENS:  # safety net against a reply that never hits EOS
+            if job.buffer:
+                _emit(job, job.buffer)
+            _finish(job)
+            continue
+
+        continuing.append(job)
+
+    if not continuing:
+        return
+
+    # run every continuing job's next decode step together, in one batched forward pass
+    model = continuing[0].model
+    past_lens = [job.chat.cache[0][0].shape[2] for job in continuing]
+    max_len = max(past_lens)
+
+    batched_cache = []
+    for layer in range(NUM_LAYERS):
+        ks, vs = [], []
+        for job in continuing:
+            k, v = job.chat.cache[layer]
+            pad = max_len - k.shape[2]
+            if pad:  # left-pad shorter caches with zeros so every row lines up at the same length
+                zeros_k = torch.zeros((1, k.shape[1], pad, k.shape[3]), dtype=k.dtype, device=k.device)
+                zeros_v = torch.zeros((1, v.shape[1], pad, v.shape[3]), dtype=v.dtype, device=v.device)
+                k = torch.cat([zeros_k, k], dim=2)
+                v = torch.cat([zeros_v, v], dim=2)
+            ks.append(k)
+            vs.append(v)
+        batched_cache.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+
+    input_ids = torch.tensor([[job.next_token] for job in continuing], device=DEVICE)
+    position_ids = torch.tensor([[p] for p in past_lens], device=DEVICE)  # each row's unpadded position
+    pad_mask = torch.zeros(len(continuing), max_len + 1, dtype=torch.bool, device=DEVICE)
+    for i, p in enumerate(past_lens):
+        pad_mask[i, max_len - p:] = True  # real past (right-aligned) plus this step's new token
+
+    with torch.no_grad():
+        logits, present_kv = model(
+            input_ids, full_past_kv=batched_cache, position_ids=position_ids, pad_mask=pad_mask
+        )
+
+    for i, job in enumerate(continuing):
+        new_len = past_lens[i] + 1
+        # slice this row's own (unpadded) cache back out -- padding only existed for the shared call
+        job.chat.cache = [(k[i:i + 1, :, -new_len:, :], v[i:i + 1, :, -new_len:, :]) for k, v in present_kv]
+        job.next_token = _sample(logits[i, -1])
 
 
 threading.Thread(target=_worker, daemon=True).start()
@@ -147,9 +236,10 @@ class Chat:
     def send_stream(self, model, text):
         """Yield decoded reply pieces as they're generated, updating chat state as it goes.
 
-        Every message, from every chat, is enqueued and handled by a single background worker
-        that processes one at a time in FIFO order -- this is what keeps two messages from ever
-        touching the model or a chat's cache at the same time. The message itself is recorded
+        Every message is enqueued and handled by a single background worker: a new request is
+        prefilled once (`_admit`), then joins `active` and gets one decode step per worker loop
+        alongside every other in-flight reply -- so multiple chats generate concurrently without
+        ever touching the model from more than one thread. The message itself is recorded
         immediately (`pending`), though, so it's never invisible while queued behind others.
         """
         self.pending.append(text)

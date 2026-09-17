@@ -74,7 +74,7 @@ class QwenAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=True)
         self.o_proj = torch.nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x, cos, sin, past_kv=None):
+    def forward(self, x, cos, sin, mask, past_kv=None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NUM_HEADS, HEAD_DIM).transpose(1, 2)
         k = self.k_proj(x).view(B, T, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
@@ -94,7 +94,7 @@ class QwenAttention(torch.nn.Module):
         k = repeat_kv(k)
         v = repeat_kv(v)
 
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=(past_kv is None))
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).reshape(B, T, NUM_HEADS * HEAD_DIM)
         return self.o_proj(out), present_kv
 
@@ -118,8 +118,8 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin, past_kv=None):
-        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, past_kv)
+    def forward(self, x, cos, sin, mask, past_kv=None):
+        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, mask, past_kv)
         x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x, present_kv
@@ -135,23 +135,35 @@ class Qwen2ForCausalLM(torch.nn.Module):
         inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, HEAD_DIM, 2).float() / HEAD_DIM))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def rope_cos_sin(self, seq_len, past_len, device, dtype):
-        t = torch.arange(past_len, past_len + seq_len, device=device).float()
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos()[None, None].to(dtype), emb.sin()[None, None].to(dtype)
+    def rope_cos_sin(self, position_ids, dtype):
+        # position_ids: [B, T], one RoPE position per row (rows can differ, e.g. batched decode)
+        freqs = position_ids.to(torch.float32)[..., None] * self.inv_freq[None, None, :]  # [B, T, head_dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1)  # [B, T, head_dim]
+        return emb.cos()[:, None].to(dtype), emb.sin()[:, None].to(dtype)  # [B, 1, T, head_dim]
 
-    def forward(self, input_ids, full_past_kv):
+    def forward(self, input_ids, full_past_kv=None, position_ids=None, pad_mask=None):
+        B, T = input_ids.shape
         x = self.embed_tokens(input_ids)
         past_len = full_past_kv[0][0].shape[2] if full_past_kv is not None else 0
-        cos, sin = self.rope_cos_sin(input_ids.shape[1], past_len, x.device, x.dtype)
+
+        if position_ids is None:
+            position_ids = torch.arange(past_len, past_len + T, device=x.device).unsqueeze(0).expand(B, -1)
+        cos, sin = self.rope_cos_sin(position_ids, x.dtype)
+
+        # bottom-right aligned causal mask: a block of T new queries always sees
+        # everything up to and including itself, regardless of how much past_kv precedes it
+        S = past_len + T
+        causal = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(diagonal=S - T)
+        mask = causal[None, None]  # [1, 1, T, S]
+        if pad_mask is not None:
+            mask = mask & pad_mask[:, None, None, :]  # [B, 1, 1, S], masks out padded batch rows
 
         if full_past_kv is None:
             full_past_kv = [None] * NUM_LAYERS
 
         full_present_kv = []
         for layer, past_kv in zip(self.layers, full_past_kv):
-            x, present_kv = layer(x, cos, sin, past_kv)
+            x, present_kv = layer(x, cos, sin, mask, past_kv)
             full_present_kv.append(present_kv)
 
         x = self.norm(x)
