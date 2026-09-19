@@ -136,8 +136,13 @@ def _worker():
     while True:
         if not active:
             _admit(_job_queue.get())  # block until at least one request comes in
-        while not _job_queue.empty():
-            _admit(_job_queue.get())  # pick up anything else that's arrived since
+        elif not _job_queue.empty():
+            # admit at most one new job per tick: _admit() runs a full, un-chunked prefill
+            # over that job's prompt, which blocks every already-active job's decode step
+            # for as long as it takes. Draining the whole queue here would stack those
+            # prefills back-to-back before any already-streaming reply got to advance again;
+            # admitting one at a time interleaves a decode step in between instead.
+            _admit(_job_queue.get())
         _process(active)
 
 
@@ -203,9 +208,16 @@ def _process(active):
 
     input_ids = torch.tensor([[job.next_token] for job in continuing], device=DEVICE)
     position_ids = torch.tensor([[p] for p in past_lens], device=DEVICE)  # each row's unpadded position
-    pad_mask = torch.zeros(len(continuing), max_len + 1, dtype=torch.bool, device=DEVICE)
-    for i, p in enumerate(past_lens):
-        pad_mask[i, max_len - p:] = True  # real past (right-aligned) plus this step's new token
+
+    if max_len == min(past_lens):
+        # every row is already the same length (the common case -- one job alone, or several
+        # jobs that happen to line up) -- nothing is actually padded, so skip building a mask
+        # and let attention use its fused causal kernel instead
+        pad_mask = None
+    else:
+        pad_mask = torch.zeros(len(continuing), max_len + 1, dtype=torch.bool, device=DEVICE)
+        for i, p in enumerate(past_lens):
+            pad_mask[i, max_len - p:] = True  # real past (right-aligned) plus this step's new token
 
     with torch.no_grad():
         logits, present_kv = model(

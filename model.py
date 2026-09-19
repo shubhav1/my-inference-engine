@@ -74,7 +74,7 @@ class QwenAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=True)
         self.o_proj = torch.nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x, cos, sin, mask, past_kv=None):
+    def forward(self, x, cos, sin, mask, is_causal, past_kv=None):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NUM_HEADS, HEAD_DIM).transpose(1, 2)
         k = self.k_proj(x).view(B, T, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
@@ -94,7 +94,12 @@ class QwenAttention(torch.nn.Module):
         k = repeat_kv(k)
         v = repeat_kv(v)
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # mask is None whenever every row is a plain (unpadded) causal sequence -- let SDPA
+        # use its fused kernel (is_causal) instead of materializing an explicit attn_mask
+        if mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).reshape(B, T, NUM_HEADS * HEAD_DIM)
         return self.o_proj(out), present_kv
 
@@ -118,8 +123,8 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin, mask, past_kv=None):
-        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, mask, past_kv)
+    def forward(self, x, cos, sin, mask, is_causal, past_kv=None):
+        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, mask, is_causal, past_kv)
         x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x, present_kv
@@ -151,19 +156,35 @@ class Qwen2ForCausalLM(torch.nn.Module):
         cos, sin = self.rope_cos_sin(position_ids, x.dtype)
 
         # bottom-right aligned causal mask: a block of T new queries always sees
-        # everything up to and including itself, regardless of how much past_kv precedes it
-        S = past_len + T
-        causal = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(diagonal=S - T)
-        mask = causal[None, None]  # [1, 1, T, S]
-        if pad_mask is not None:
-            mask = mask & pad_mask[:, None, None, :]  # [B, 1, 1, S], masks out padded batch rows
+        # everything up to and including itself, regardless of how much past_kv precedes it.
+        #
+        # Two cases can skip building that mask and use SDPA's fused is_causal kernel instead
+        # (only safe when pad_mask is None, i.e. nothing in the batch is padded):
+        #   - T == 1 (a decode step): a single query trivially satisfies causality by attending
+        #     to every cached key, so no mask is needed at all (is_causal=False, mask=None).
+        #     NOTE: is_causal=True here would be wrong -- PyTorch's is_causal uses *top-left*
+        #     alignment when T != S, so with T=1 it would attend to only the very first key.
+        #   - T > 1 with past_len == 0 (a fresh prefill): T == S here, so top-left and
+        #     bottom-right causal masks coincide and is_causal=True is exact.
+        # Any other shape (T > 1 with an existing past_kv, e.g. prefilling a multi-token
+        # follow-up message onto a chat's cache) needs the real bottom-right mask below.
+        is_causal = False
+        if pad_mask is None and (T == 1 or past_len == 0):
+            mask = None
+            is_causal = (past_len == 0)
+        else:
+            S = past_len + T
+            causal = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(diagonal=S - T)
+            mask = causal[None, None]
+            if pad_mask is not None:
+                mask = mask & pad_mask[:, None, None, :]  # [B, 1, 1, S]
 
         if full_past_kv is None:
             full_past_kv = [None] * NUM_LAYERS
 
         full_present_kv = []
         for layer, past_kv in zip(self.layers, full_past_kv):
-            x, present_kv = layer(x, cos, sin, mask, past_kv)
+            x, present_kv = layer(x, cos, sin, mask, is_causal, past_kv)
             full_present_kv.append(present_kv)
 
         x = self.norm(x)
