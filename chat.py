@@ -1,15 +1,25 @@
 import queue
 import threading
+import time
 
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from model import NUM_LAYERS, Qwen2ForCausalLM
+from kv_cache import KVCache
+from model import Qwen2ForCausalLM
 from tokenizer import QwenTokenizer
 
 MODEL_PATH = "./qwen2.5-1.5b"
 MAX_REPLY_TOKENS = 512  # safety net against a reply that never hits EOS
 TEMPERATURE = 1
+
+# Sizes the shared static KV cache (see kv_cache.py): MAX_BATCH_SIZE is how many chats can
+# hold a live cache slot at once (a slot is held for a chat's whole lifetime, not just while
+# it's actively streaming, since cache must persist across turns), the (MAX_BATCH_SIZE + 1)th
+# chat to send a first message simply waits for one to free up (see `_deferred` in _worker).
+# MAX_SEQ_LEN caps total tokens (prompt + every turn + every reply) any one chat can reach.
+MAX_BATCH_SIZE = 8
+MAX_SEQ_LEN = 2048
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -17,6 +27,8 @@ elif torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 else:
     DEVICE = torch.device("cpu")
+
+KV_CACHE = KVCache(MAX_BATCH_SIZE, MAX_SEQ_LEN, DEVICE, dtype=torch.float32)
 
 
 def load_qwen(model_path):
@@ -52,19 +64,21 @@ def _find_stop(text, patterns):
     return best
 
 
-def generate(model, past_cache, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
+def generate(model, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
+    """Single-sequence reference generation loop (used by the benchmark harness): allocates
+    its own private single-slot KV cache, prefills the prompt, then decodes up to max_tokens."""
+    cache = KVCache(1, MAX_SEQ_LEN, DEVICE, dtype=next(model.parameters()).dtype)
+    slot = cache.alloc()
+
     next_id = new_ids
     is_first = True
     for _ in range(max_tokens):
         with torch.no_grad():
             input_id = torch.tensor([next_id] if is_first else [[next_id]], device=DEVICE)
             is_first = False
-            logits, pres_cache = model(input_id, full_past_kv=past_cache)
-        past_cache = pres_cache
-        # next_id = logits[0, -1].argmax().item()
-        probs = F.softmax(logits[0, -1] / TEMPERATURE, dim=-1)
-        next_id = torch.multinomial(probs, num_samples=1).item()
-        yield next_id, pres_cache
+            logits = model(input_id, cache, [slot])
+        next_id = _sample(logits[0, -1])
+        yield next_id
         if next_id == eos_id:
             break
 
@@ -87,6 +101,11 @@ def _sample(logit_row):
 
 _job_queue = queue.Queue()
 active = []
+_deferred = []  # jobs waiting on a new chat's first message, held back until a cache slot frees
+
+
+def _needs_new_slot(job):
+    return job.chat.slot is None
 
 
 def _admit(job):
@@ -103,10 +122,12 @@ def _admit(job):
     chat.listeners = [job.out_queue]  # set before in_progress: closes the window watch() could miss it
     chat.in_progress = ""  # visible to any page render while this reply is still streaming
 
+    if chat.slot is None:  # first message of this chat's lifetime, reserve its cache row
+        chat.slot = KV_CACHE.alloc()
+
     input_ids = torch.tensor([new_ids], device=DEVICE)
     with torch.no_grad():
-        logits, cache = model(input_ids, full_past_kv=chat.cache)
-    chat.cache = cache
+        logits = model(input_ids, KV_CACHE, [chat.slot])
     job.next_token = _sample(logits[0, -1])
 
     active.append(job)
@@ -123,7 +144,9 @@ def _finish(job):
     trailing = chat.tokenizer.encode("\n")
     chat.ids.extend(trailing)
     with torch.no_grad():
-        _, chat.cache = job.model(torch.tensor([trailing], device=DEVICE), full_past_kv=chat.cache)
+        job.model(torch.tensor([trailing], device=DEVICE), KV_CACHE, [chat.slot])
+    # chat.slot is NOT freed here -- the conversation continues across turns, so its cache
+    # row has to survive until the chat itself is cleared or deleted (see Chat.release).
     chat.messages.append(("assistant", chat.in_progress))
     chat.in_progress = None
     for q in chat.listeners:
@@ -132,17 +155,38 @@ def _finish(job):
     active.remove(job)
 
 
+def _try_admit_or_defer(job):
+    """Admit `job` if it can get a cache slot; otherwise hold it until one frees up.
+
+    A follow-up message in a chat that already owns a slot always proceeds, only a chat's
+    very first message needs a fresh one, and the static cache has a fixed number of rows.
+    """
+    if not _needs_new_slot(job) or KV_CACHE.free_slot_count() > 0:
+        _admit(job)
+    else:
+        _deferred.append(job)
+
+
 def _worker():
     while True:
-        if not active:
-            _admit(_job_queue.get())  # block until at least one request comes in
+        # a slot may have freed up (a chat got cleared/deleted) since we last checked
+        for job in [j for j in _deferred if not _needs_new_slot(j) or KV_CACHE.free_slot_count() > 0]:
+            _deferred.remove(job)
+            _admit(job)
+
+        if not active and not _deferred:
+            _try_admit_or_defer(_job_queue.get())  # block until at least one request comes in
+        elif not active and _deferred:
+            # nothing decoding and the deferred job(s) still have no free slot -- avoid
+            # busy-spinning on an empty `active` list while waiting for one to free up
+            time.sleep(0.05)
         elif not _job_queue.empty():
             # admit at most one new job per tick: _admit() runs a full, un-chunked prefill
             # over that job's prompt, which blocks every already-active job's decode step
             # for as long as it takes. Draining the whole queue here would stack those
             # prefills back-to-back before any already-streaming reply got to advance again;
             # admitting one at a time interleaves a decode step in between instead.
-            _admit(_job_queue.get())
+            _try_admit_or_defer(_job_queue.get())
         _process(active)
 
 
@@ -186,48 +230,17 @@ def _process(active):
     if not continuing:
         return
 
-    # run every continuing job's next decode step together, in one batched forward pass
+    # run every continuing job's next decode step together, in one batched forward pass --
+    # each job just points at its own row (slot) in the shared static KV cache, so there's
+    # no padding or copying to assemble here regardless of how ragged their lengths are
     model = continuing[0].model
-    past_lens = [job.chat.cache[0][0].shape[2] for job in continuing]
-    max_len = max(past_lens)
-
-    batched_cache = []
-    for layer in range(NUM_LAYERS):
-        ks, vs = [], []
-        for job in continuing:
-            k, v = job.chat.cache[layer]
-            pad = max_len - k.shape[2]
-            if pad:  # left-pad shorter caches with zeros so every row lines up at the same length
-                zeros_k = torch.zeros((1, k.shape[1], pad, k.shape[3]), dtype=k.dtype, device=k.device)
-                zeros_v = torch.zeros((1, v.shape[1], pad, v.shape[3]), dtype=v.dtype, device=v.device)
-                k = torch.cat([zeros_k, k], dim=2)
-                v = torch.cat([zeros_v, v], dim=2)
-            ks.append(k)
-            vs.append(v)
-        batched_cache.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
-
+    slots = [job.chat.slot for job in continuing]
     input_ids = torch.tensor([[job.next_token] for job in continuing], device=DEVICE)
-    position_ids = torch.tensor([[p] for p in past_lens], device=DEVICE)  # each row's unpadded position
-
-    if max_len == min(past_lens):
-        # every row is already the same length (the common case -- one job alone, or several
-        # jobs that happen to line up) -- nothing is actually padded, so skip building a mask
-        # and let attention use its fused causal kernel instead
-        pad_mask = None
-    else:
-        pad_mask = torch.zeros(len(continuing), max_len + 1, dtype=torch.bool, device=DEVICE)
-        for i, p in enumerate(past_lens):
-            pad_mask[i, max_len - p:] = True  # real past (right-aligned) plus this step's new token
 
     with torch.no_grad():
-        logits, present_kv = model(
-            input_ids, full_past_kv=batched_cache, position_ids=position_ids, pad_mask=pad_mask
-        )
+        logits = model(input_ids, KV_CACHE, slots)
 
     for i, job in enumerate(continuing):
-        new_len = past_lens[i] + 1
-        # slice this row's own (unpadded) cache back out -- padding only existed for the shared call
-        job.chat.cache = [(k[i:i + 1, :, -new_len:, :], v[i:i + 1, :, -new_len:, :]) for k, v in present_kv]
         job.next_token = _sample(logits[i, -1])
 
 
@@ -238,19 +251,26 @@ class Chat:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.ids = []
-        self.cache = None
+        self.slot = None  # this chat's row in KV_CACHE, reserved on its first message
         self.messages = []
         self.pending = []  # user texts submitted but not yet picked up by the worker
         self.in_progress = None  # reply text generated so far, while one is actively streaming
         self.listeners = []  # queues currently watching the active generation, if any
         self.eos_id = tokenizer.encoder["<|endoftext|>"]
 
+    def release(self):
+        """Free this chat's KV-cache slot, if it holds one. Call when the chat is cleared or
+        deleted so another chat can use that row, the cache has a fixed number of them."""
+        if self.slot is not None:
+            KV_CACHE.free(self.slot)
+            self.slot = None
+
     def send_stream(self, model, text):
         """Yield decoded reply pieces as they're generated, updating chat state as it goes.
 
         Every message is enqueued and handled by a single background worker: a new request is
         prefilled once (`_admit`), then joins `active` and gets one decode step per worker loop
-        alongside every other in-flight reply -- so multiple chats generate concurrently without
+        alongside every other in-flight reply, so multiple chats generate concurrently without
         ever touching the model from more than one thread. The message itself is recorded
         immediately (`pending`), though, so it's never invisible while queued behind others.
         """

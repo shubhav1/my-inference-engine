@@ -17,7 +17,7 @@ RESULTS_FILE = Path(__file__).resolve().parent / "results.md"
 
 def warmup(model, tokenizer):
     ids = tokenizer.encode(PROMPT)
-    for _ in generate(model, None, ids, NO_EOS, max_tokens=1):
+    for _ in generate(model, ids, NO_EOS, max_tokens=1):
         pass
 
 
@@ -27,7 +27,7 @@ def run_benchmark(model, tokenizer):
     token_times = []
     start = time.perf_counter()
     prev = start
-    for _ in generate(model, None, ids, NO_EOS, max_tokens=NUM_TOKENS):
+    for _ in generate(model, ids, NO_EOS, max_tokens=NUM_TOKENS):
         now = time.perf_counter()
         token_times.append(now - prev)
         prev = now

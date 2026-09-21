@@ -74,7 +74,7 @@ class QwenAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=True)
         self.o_proj = torch.nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x, cos, sin, mask, is_causal, past_kv=None):
+    def forward(self, x, cos, sin, mask, is_causal, cache, layer_idx, slots, slots_list, starts_list, S):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NUM_HEADS, HEAD_DIM).transpose(1, 2)
         k = self.k_proj(x).view(B, T, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
@@ -82,13 +82,12 @@ class QwenAttention(torch.nn.Module):
 
         q, k = apply_rope(q, k, cos, sin)
 
-        # cached kv
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-
-        present_kv = (k, v)
+        # write this step's new k/v into the preallocated cache in place (no copy, no
+        # reallocation) using plain-int indices (a tensor index here would force a
+        # host-device sync per layer to read it), then read back a view of every valid
+        # position so far using the tensor form (which indexes without a host round trip)
+        cache.write(layer_idx, slots_list, starts_list, k, v)
+        k, v = cache.read(layer_idx, slots, S)
 
         # grouped-query attention (GQA): repeat each kv head for its group of query heads
         k = repeat_kv(k)
@@ -101,7 +100,7 @@ class QwenAttention(torch.nn.Module):
         else:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).reshape(B, T, NUM_HEADS * HEAD_DIM)
-        return self.o_proj(out), present_kv
+        return self.o_proj(out)
 
 # MLP
 class QwenMLP(torch.nn.Module):
@@ -123,11 +122,14 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin, mask, is_causal, past_kv=None):
-        attention_output, present_kv = self.self_attn(self.input_layernorm(x), cos, sin, mask, is_causal, past_kv)
+    def forward(self, x, cos, sin, mask, is_causal, cache, layer_idx, slots, slots_list, starts_list, S):
+        attention_output = self.self_attn(
+            self.input_layernorm(x), cos, sin, mask, is_causal,
+            cache, layer_idx, slots, slots_list, starts_list, S,
+        )
         x = x + attention_output
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x, present_kv
+        return x
 
 # full Qwen model
 class Qwen2ForCausalLM(torch.nn.Module):
@@ -146,47 +148,48 @@ class Qwen2ForCausalLM(torch.nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)  # [B, T, head_dim]
         return emb.cos()[:, None].to(dtype), emb.sin()[:, None].to(dtype)  # [B, 1, T, head_dim]
 
-    def forward(self, input_ids, full_past_kv=None, position_ids=None, pad_mask=None):
-        B, T = input_ids.shape
+    def forward(self, input_ids, cache, slots):
+        """input_ids: [B, T]. cache: a KVCache. slots: that cache's row for each batch item
+        (list[int] or LongTensor[B]), every row's prior length lives in cache.lengths[slots].
+        """
+        _, T = input_ids.shape
         x = self.embed_tokens(input_ids)
-        past_len = full_past_kv[0][0].shape[2] if full_past_kv is not None else 0
 
-        if position_ids is None:
-            position_ids = torch.arange(past_len, past_len + T, device=x.device).unsqueeze(0).expand(B, -1)
+        # each row's valid length before this step's write
+        slots = torch.as_tensor(slots, dtype=torch.long, device=x.device)
+        starts = cache.lengths[slots].clone()
+        # plain ints for cache.write() -- indexing with a tensor there would sync every layer
+        slots_list = slots.tolist()
+        starts_list = starts.tolist()
+
+        # RoPE position per row, offset by how much of its cache is already filled
+        position_ids = starts[:, None] + torch.arange(T, device=x.device)[None, :]
         cos, sin = self.rope_cos_sin(position_ids, x.dtype)
 
-        # bottom-right aligned causal mask: a block of T new queries always sees
-        # everything up to and including itself, regardless of how much past_kv precedes it.
-        #
-        # Two cases can skip building that mask and use SDPA's fused is_causal kernel instead
-        # (only safe when pad_mask is None, i.e. nothing in the batch is padded):
-        #   - T == 1 (a decode step): a single query trivially satisfies causality by attending
-        #     to every cached key, so no mask is needed at all (is_causal=False, mask=None).
-        #     NOTE: is_causal=True here would be wrong -- PyTorch's is_causal uses *top-left*
-        #     alignment when T != S, so with T=1 it would attend to only the very first key.
-        #   - T > 1 with past_len == 0 (a fresh prefill): T == S here, so top-left and
-        #     bottom-right causal masks coincide and is_causal=True is exact.
-        # Any other shape (T > 1 with an existing past_kv, e.g. prefilling a multi-token
-        # follow-up message onto a chat's cache) needs the real bottom-right mask below.
-        is_causal = False
-        if pad_mask is None and (T == 1 or past_len == 0):
+        # skip building an explicit mask when every row shares the same start, SDPA's
+        # fused is_causal kernel is exact then (True only for a fresh prefill; PyTorch's
+        # is_causal is top-left aligned, so a T==1 decode step needs mask=None instead)
+        same_start = bool((starts == starts[0]).all().item())
+        c0 = int(starts[0].item())
+        if same_start and (T == 1 or c0 == 0):
             mask = None
-            is_causal = (past_len == 0)
+            is_causal = (c0 == 0)
+            S = c0 + T
         else:
-            S = past_len + T
-            causal = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(diagonal=S - T)
-            mask = causal[None, None]
-            if pad_mask is not None:
-                mask = mask & pad_mask[:, None, None, :]  # [B, 1, 1, S]
+            # ragged batch: build the real bottom-right causal mask from each row's own start
+            S = int(starts.max().item()) + T
+            key_pos = torch.arange(S, device=x.device)
+            query_pos = starts[:, None] + torch.arange(T, device=x.device)[None, :]  # [B, T]
+            mask = (key_pos[None, None, :] <= query_pos[:, :, None]).unsqueeze(1)  # [B, 1, T, S]
+            is_causal = False
 
-        if full_past_kv is None:
-            full_past_kv = [None] * NUM_LAYERS
+        # run every layer, each writing this step's k/v into the cache as it goes
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, mask, is_causal, cache, layer_idx, slots, slots_list, starts_list, S)
 
-        full_present_kv = []
-        for layer, past_kv in zip(self.layers, full_past_kv):
-            x, present_kv = layer(x, cos, sin, mask, is_causal, past_kv)
-            full_present_kv.append(present_kv)
+        # advance every row's length once, now that all layers have written this step
+        cache.lengths[slots] = starts + T
 
         x = self.norm(x)
         logits = x @ self.embed_tokens.weight.T
-        return logits, full_present_kv
+        return logits
