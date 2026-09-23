@@ -169,10 +169,12 @@ def _try_admit_or_defer(job):
 
 def _worker():
     while True:
-        # a slot may have freed up (a chat got cleared/deleted) since we last checked
-        for job in [j for j in _deferred if not _needs_new_slot(j) or KV_CACHE.free_slot_count() > 0]:
-            _deferred.remove(job)
-            _admit(job)
+        # a slot may have freed up (a chat got cleared/deleted) since we last checked -- re-check
+        # per job, since admitting one can take the last free slot another was counting on
+        for job in list(_deferred):
+            if not _needs_new_slot(job) or KV_CACHE.free_slot_count() > 0:
+                _deferred.remove(job)
+                _admit(job)
 
         if not active and not _deferred:
             _try_admit_or_defer(_job_queue.get())  # block until at least one request comes in

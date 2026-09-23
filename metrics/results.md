@@ -7,4 +7,4 @@
 | 2026-09-17 | 13:35:18 | continuous batching implemented (dynamic admission + padded batched decode steps) | mps | Explain what a neural network is in simple terms. | 50 | 0.102 | 0.058 | 16.98 |
 | 2026-09-19 | 12:40:10 | fused SDPA kernel restored + admission fairness | mps | Explain what a neural network is in simple terms. | 50 | 0.086 | 0.051 | 19.38 |
 | 2026-09-20 | 22:08:13 | static preallocated KV cache | mps | Explain what a neural network is in simple terms. | 50 | 0.089 | 0.051 | 19.23 |
-| 2026-09-20 | 23:29:26 | [HF transformers] HF transformers baseline (reference) | mps | Explain what a neural network is in simple terms. | 50 | 0.070 | 0.061 | 16.27 |
+| 2026-09-20 | 23:29:26 | HF transformers baseline (reference) | mps | Explain what a neural network is in simple terms. | 50 | 0.070 | 0.061 | 16.27 |
