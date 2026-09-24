@@ -13,12 +13,14 @@ MODEL_PATH = "./qwen2.5-1.5b"
 MAX_REPLY_TOKENS = 512  # safety net against a reply that never hits EOS
 TEMPERATURE = 1
 
-# Sizes the shared static KV cache (see kv_cache.py): MAX_BATCH_SIZE is how many chats can
-# hold a live cache slot at once (a slot is held for a chat's whole lifetime, not just while
-# it's actively streaming, since cache must persist across turns), the (MAX_BATCH_SIZE + 1)th
-# chat to send a first message simply waits for one to free up (see `_deferred` in _worker).
-# MAX_SEQ_LEN caps total tokens (prompt + every turn + every reply) any one chat can reach.
-MAX_BATCH_SIZE = 8
+# Sizes the shared paged KV cache (see kv_cache.py): KV_CACHE_TOKENS is the total token
+# budget every chat draws from, carved into BLOCK_SIZE-token blocks that a chat takes only as
+# it grows. There is no fixed number of chats: a message is admitted whenever there are enough
+# free blocks for its prompt plus a full reply, evicting idle chats' caches if needed (they
+# re-prefill from their token history on their next turn), otherwise it waits in `_deferred`.
+# MAX_SEQ_LEN only sizes generate()'s private single-sequence cache.
+BLOCK_SIZE = 16
+KV_CACHE_TOKENS = 8 * 2048  # same memory budget the old static cache had (8 slots x 2048 tokens)
 MAX_SEQ_LEN = 2048
 
 if torch.cuda.is_available():
@@ -28,7 +30,7 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-KV_CACHE = KVCache(MAX_BATCH_SIZE, MAX_SEQ_LEN, DEVICE, dtype=torch.float32)
+KV_CACHE = KVCache(KV_CACHE_TOKENS // BLOCK_SIZE, BLOCK_SIZE, DEVICE, dtype=torch.float32)
 
 
 def load_qwen(model_path):
@@ -66,9 +68,9 @@ def _find_stop(text, patterns):
 
 def generate(model, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
     """Single-sequence reference generation loop (used by the benchmark harness): allocates
-    its own private single-slot KV cache, prefills the prompt, then decodes up to max_tokens."""
-    cache = KVCache(1, MAX_SEQ_LEN, DEVICE, dtype=next(model.parameters()).dtype)
-    slot = cache.alloc()
+    its own private KV cache, prefills the prompt, then decodes up to max_tokens."""
+    cache = KVCache(MAX_SEQ_LEN // BLOCK_SIZE, BLOCK_SIZE, DEVICE, dtype=next(model.parameters()).dtype)
+    seq = cache.alloc()
 
     next_id = new_ids
     is_first = True
@@ -76,7 +78,7 @@ def generate(model, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
         with torch.no_grad():
             input_id = torch.tensor([next_id] if is_first else [[next_id]], device=DEVICE)
             is_first = False
-            logits = model(input_id, cache, [slot])
+            logits = model(input_id, cache, [seq])
         next_id = _sample(logits[0, -1])
         yield next_id
         if next_id == eos_id:
@@ -92,6 +94,7 @@ class _Job:
         self.buffer = ""  # decoded text held back in case it's the start of a stop sequence
         self.steps = 0
         self.next_token = None  # token most recently produced, to be fed on this job's next decode call
+        self.new_ids = chat.tokenizer.encode(f"User: {text}\nAssistant:")
 
 
 def _sample(logit_row):
@@ -101,11 +104,49 @@ def _sample(logit_row):
 
 _job_queue = queue.Queue()
 active = []
-_deferred = []  # jobs waiting on a new chat's first message, held back until a cache slot frees
+_deferred = []  # jobs waiting for enough free KV-cache blocks to be admitted
+_resident = []  # chats whose history is in KV_CACHE, least recently used first
+_cache_lock = threading.Lock()  # Chat.release() runs on request threads, eviction on the worker
 
 
-def _needs_new_slot(job):
-    return job.chat.slot is None
+def _reserve_len(job):
+    """Tokens job's chat can reach by the end of this turn: its history, this prompt, a full
+    reply, and the "\n" that _finish() appends -- reserved up front so decode never runs dry."""
+    trailing = len(job.chat.tokenizer.encode("\n"))
+    return len(job.chat.ids) + len(job.new_ids) + MAX_REPLY_TOKENS + trailing
+
+
+def _blocks_needed(job):
+    return KV_CACHE.blocks_needed(job.chat.seq, _reserve_len(job))
+
+
+def _evict(chat):
+    """Drop an idle chat's cache. Its token history stays in chat.ids, so its next turn simply
+    re-prefills it (see _admit) -- trading recompute for not pinning memory between turns."""
+    KV_CACHE.free(chat.seq)
+    chat.seq = None
+    _resident.remove(chat)
+
+
+def _make_room(job):
+    """Free blocks until `job` fits, evicting idle chats' caches oldest-first. False if it still
+    can't fit because the rest is held by replies that are mid-generation."""
+    busy = {j.chat for j in active} | {job.chat}
+    with _cache_lock:
+        while _blocks_needed(job) > KV_CACHE.free_block_count():
+            idle = [c for c in _resident if c not in busy]
+            if not idle:
+                return False
+            _evict(idle[0])
+    return True
+
+
+def _touch(chat):
+    """Mark chat most recently used, so eviction picks it last."""
+    with _cache_lock:
+        if chat in _resident:
+            _resident.remove(chat)
+        _resident.append(chat)
 
 
 def _admit(job):
@@ -115,19 +156,25 @@ def _admit(job):
     """
     chat, model, text = job.chat, job.model, job.text
 
+    reserve_len = _reserve_len(job)  # before chat.ids grows below
     chat.pending.remove(text)  # this message is now being handled, not just waiting
     chat.messages.append(("user", text))
-    new_ids = chat.tokenizer.encode(f"User: {text}\nAssistant:")
-    chat.ids.extend(new_ids)
+    chat.ids.extend(job.new_ids)
     chat.listeners = [job.out_queue]  # set before in_progress: closes the window watch() could miss it
     chat.in_progress = ""  # visible to any page render while this reply is still streaming
 
-    if chat.slot is None:  # first message of this chat's lifetime, reserve its cache row
-        chat.slot = KV_CACHE.alloc()
+    if chat.seq is None:
+        # first message, or this chat's cache was evicted while idle: prefill its whole history
+        chat.seq = KV_CACHE.alloc()
+        prefill_ids = chat.ids
+    else:
+        prefill_ids = job.new_ids
+    KV_CACHE.ensure_capacity(chat.seq, reserve_len)  # _make_room() already checked these are free
+    _touch(chat)
 
-    input_ids = torch.tensor([new_ids], device=DEVICE)
+    input_ids = torch.tensor([prefill_ids], device=DEVICE)
     with torch.no_grad():
-        logits = model(input_ids, KV_CACHE, [chat.slot])
+        logits = model(input_ids, KV_CACHE, [chat.seq])
     job.next_token = _sample(logits[0, -1])
 
     active.append(job)
@@ -142,11 +189,17 @@ def _emit(job, piece):
 def _finish(job):
     chat = job.chat
     trailing = chat.tokenizer.encode("\n")
+    # the reply's last token was appended to chat.ids but never fed back through the model,
+    # so write it into the cache together with the trailing "\n"
+    tail = chat.ids[-1:] + trailing
     chat.ids.extend(trailing)
     with torch.no_grad():
-        job.model(torch.tensor([trailing], device=DEVICE), KV_CACHE, [chat.slot])
-    # chat.slot is NOT freed here -- the conversation continues across turns, so its cache
-    # row has to survive until the chat itself is cleared or deleted (see Chat.release).
+        job.model(torch.tensor([tail], device=DEVICE), KV_CACHE, [chat.seq])
+    # the cache is NOT freed here -- the conversation continues across turns -- but blocks
+    # reserved for reply tokens that were never generated go back to the pool
+    with _cache_lock:
+        KV_CACHE.trim(chat.seq)
+    _touch(chat)
     chat.messages.append(("assistant", chat.in_progress))
     chat.in_progress = None
     for q in chat.listeners:
@@ -155,13 +208,19 @@ def _finish(job):
     active.remove(job)
 
 
-def _try_admit_or_defer(job):
-    """Admit `job` if it can get a cache slot; otherwise hold it until one frees up.
+def _reject(job, reason):
+    """Answer a message that can never fit in the cache, instead of deferring it forever."""
+    job.chat.pending.remove(job.text)
+    job.out_queue.put(f"[error: {reason}]")
+    job.out_queue.put(None)
 
-    A follow-up message in a chat that already owns a slot always proceeds, only a chat's
-    very first message needs a fresh one, and the static cache has a fixed number of rows.
-    """
-    if not _needs_new_slot(job) or KV_CACHE.free_slot_count() > 0:
+
+def _try_admit_or_defer(job):
+    """Admit `job` if its prompt plus a full reply fits in free blocks (evicting idle chats if
+    needed); otherwise hold it until replies in flight finish and give blocks back."""
+    if KV_CACHE.blocks_needed(None, _reserve_len(job)) > KV_CACHE.num_blocks:
+        _reject(job, "conversation is too long for the KV cache")
+    elif _make_room(job):
         _admit(job)
     else:
         _deferred.append(job)
@@ -169,18 +228,18 @@ def _try_admit_or_defer(job):
 
 def _worker():
     while True:
-        # a slot may have freed up (a chat got cleared/deleted) since we last checked -- re-check
-        # per job, since admitting one can take the last free slot another was counting on
+        # blocks may have freed up (a reply finished, a chat got cleared) since we last checked --
+        # re-check per job, since admitting one can take the blocks another was counting on
         for job in list(_deferred):
-            if not _needs_new_slot(job) or KV_CACHE.free_slot_count() > 0:
+            if _make_room(job):
                 _deferred.remove(job)
                 _admit(job)
 
         if not active and not _deferred:
             _try_admit_or_defer(_job_queue.get())  # block until at least one request comes in
         elif not active and _deferred:
-            # nothing decoding and the deferred job(s) still have no free slot -- avoid
-            # busy-spinning on an empty `active` list while waiting for one to free up
+            # nothing decoding and the deferred job(s) still don't fit -- avoid busy-spinning
+            # on an empty `active` list while waiting for a chat to be released
             time.sleep(0.05)
         elif not _job_queue.empty():
             # admit at most one new job per tick: _admit() runs a full, un-chunked prefill
@@ -233,14 +292,14 @@ def _process(active):
         return
 
     # run every continuing job's next decode step together, in one batched forward pass --
-    # each job just points at its own row (slot) in the shared static KV cache, so there's
+    # each job just points at its own block table in the shared paged KV cache, so there's
     # no padding or copying to assemble here regardless of how ragged their lengths are
     model = continuing[0].model
-    slots = [job.chat.slot for job in continuing]
+    seqs = [job.chat.seq for job in continuing]
     input_ids = torch.tensor([[job.next_token] for job in continuing], device=DEVICE)
 
     with torch.no_grad():
-        logits = model(input_ids, KV_CACHE, slots)
+        logits = model(input_ids, KV_CACHE, seqs)
 
     for i, job in enumerate(continuing):
         job.next_token = _sample(logits[i, -1])
@@ -253,7 +312,7 @@ class Chat:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.ids = []
-        self.slot = None  # this chat's row in KV_CACHE, reserved on its first message
+        self.seq = None  # this chat's sequence in KV_CACHE, None until first message or after eviction
         self.messages = []
         self.pending = []  # user texts submitted but not yet picked up by the worker
         self.in_progress = None  # reply text generated so far, while one is actively streaming
@@ -261,11 +320,11 @@ class Chat:
         self.eos_id = tokenizer.encoder["<|endoftext|>"]
 
     def release(self):
-        """Free this chat's KV-cache slot, if it holds one. Call when the chat is cleared or
-        deleted so another chat can use that row, the cache has a fixed number of them."""
-        if self.slot is not None:
-            KV_CACHE.free(self.slot)
-            self.slot = None
+        """Free this chat's KV-cache blocks, if it holds any. Call when the chat is cleared or
+        deleted so other chats can use them right away instead of waiting for eviction."""
+        with _cache_lock:
+            if self.seq is not None:
+                _evict(self)
 
     def send_stream(self, model, text):
         """Yield decoded reply pieces as they're generated, updating chat state as it goes.

@@ -306,7 +306,7 @@ def view_chat(name: str):
 @app.post("/chat/{name}/clear")
 def clear_chat(name: str):
     if name in chats:
-        chats[name].release()  # give back this chat's KV-cache slot, the cache has a fixed size
+        chats[name].release()  # give back this chat's KV-cache blocks so other chats can use them
         chats[name] = Chat(tokenizer)
     return RedirectResponse(f"/chat/{quote(name)}", status_code=303)
 
