@@ -11,7 +11,7 @@ class KVCache:
     Buffer shape: [NUM_LAYERS, 2, num_blocks * block_size, NUM_KV_HEADS, HEAD_DIM] (dim 1: k=0,
     v=1). The token dimension is a flat pool carved into fixed-size blocks, never resized after
     construction. A sequence owns a list of blocks (its block table), grown one block at a time
-    as it gets longer, so it only ever holds memory for tokens it actually has -- no per-sequence
+    as it gets longer, so it only ever holds memory for tokens it actually has; no per-sequence
     worst-case reservation. Logical position p of a sequence lives at physical token slot
     block_table[p // block_size] * block_size + p % block_size.
     """

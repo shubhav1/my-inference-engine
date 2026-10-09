@@ -8,6 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# FlashAttention-2 Triton kernel (needs triton + CUDA); falls back to SDPA without them
+try:
+    from kernels.fa2 import FlashAttention2Function
+except ImportError:
+    FlashAttention2Function = None
+
 # Qwen2.5-1.5B architecture constants (from config.json)
 HIDDEN_SIZE = 1536
 NUM_LAYERS = 28
@@ -91,9 +97,11 @@ class QwenAttention(torch.nn.Module):
         k = repeat_kv(k)
         v = repeat_kv(v)
 
-        # mask is None whenever every row is a plain (unpadded) causal sequence -- let SDPA
-        # use its fused kernel (is_causal) instead of materializing an explicit attn_mask
-        if mask is None:
+        # mask is None whenever every row is a plain (unpadded) causal sequence -- use the
+        # FA2 kernel (or SDPA's fused is_causal kernel) instead of an explicit attn_mask
+        if mask is None and FlashAttention2Function is not None and q.is_cuda:
+            out = FlashAttention2Function.apply(q, k, v, is_causal)
+        elif mask is None:
             out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         else:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)

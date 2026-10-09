@@ -1,5 +1,3 @@
-# not yet adapted for qwen model - WIP
-
 import triton
 import triton.language as tl
 import torch
@@ -22,8 +20,7 @@ def get_configs():
 
 @triton.autotune(
     configs=get_configs(),
-    key=["SEQLEN", "d", "d_v", "is_causal"],
-    reset_to_zero=["dQ_ptr"],
+    key=["d", "d_v", "is_causal"],  # not seq lens: they change every decode step
 )
 
 @triton.jit
@@ -41,7 +38,7 @@ def fa2_forward(
     # constexprs
     Br: tl.constexpr, Bc: tl.constexpr, 
     d: tl.constexpr, d_v: tl.constexpr,
-    is_causal: tl.constexpr, SEQLEN: tl.constexpr,
+    is_causal: tl.constexpr, SEQLEN_Q, SEQLEN_K,
 ):
     # program ids
     tile_id = tl.program_id(0)
@@ -61,7 +58,7 @@ def fa2_forward(
 
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + q_offset,
-        shape = (SEQLEN, d),
+        shape = (SEQLEN_Q, d),
         strides = (Qs_stride, Qd_stride),
         offsets = (Br * tile_id, 0),
         block_shape = (Br, d),
@@ -70,7 +67,7 @@ def fa2_forward(
 
     K_block_ptr = tl.make_block_ptr(
         K_ptr + k_offset,
-        shape = (SEQLEN, d),
+        shape = (SEQLEN_K, d),
         strides = (Ks_stride, Kd_stride),
         offsets = (0, 0),
         block_shape = (Bc, d),
@@ -79,7 +76,7 @@ def fa2_forward(
 
     V_block_ptr = tl.make_block_ptr(
         V_ptr + v_offset,
-        shape = (SEQLEN, d_v),
+        shape = (SEQLEN_K, d_v),
         strides = (Vs_stride, Vd_stride),
         offsets = (0, 0),
         block_shape = (Bc, d_v),
@@ -88,7 +85,7 @@ def fa2_forward(
 
     O_block_ptr = tl.make_block_ptr(
         O_ptr + o_offset,
-        shape = (SEQLEN, d_v),
+        shape = (SEQLEN_Q, d_v),
         strides = (Os_stride, Od_stride),
         offsets = (Br * tile_id, 0),
         block_shape = (Br, d_v),
@@ -97,7 +94,7 @@ def fa2_forward(
 
     L_block_ptr = tl.make_block_ptr(
         L_ptr + l_offset,
-        shape = (SEQLEN,),
+        shape = (SEQLEN_Q,),
         strides = (Ls_stride,),
         offsets = (Br * tile_id,),
         block_shape = (Br,),
@@ -105,7 +102,9 @@ def fa2_forward(
     )
 
     i_start = tile_id * Br
-    i_end = tl.minimum(i_start + Br, SEQLEN)
+    # causal mask is bottom-right aligned: query i sits at key position i + causal_offset
+    causal_offset = SEQLEN_K - SEQLEN_Q
+    i_end = tl.minimum(i_start + Br, SEQLEN_Q) + causal_offset
 
     # load Qi from HBM to SRAM
     Qi = tl.load(Q_block_ptr, boundary_check = (0, 1))
@@ -116,20 +115,20 @@ def fa2_forward(
     mi = tl.full((Br,), float('-inf'), dtype=tl.float32)
 
     #j_max = SEQLEN if not is_causal else i_end
-    for j_start in range(0, SEQLEN, Bc):
+    for j_start in range(0, SEQLEN_K, Bc):
         if not is_causal or (i_end > j_start):
             # load Kj, Vj from HBM to SRAM
             Kj = tl.load(K_block_ptr, boundary_check = (0,1))
             Vj = tl.load(V_block_ptr, boundary_check = (0,1))
 
             # compute Sij
-            Sij = tl.dot(Qi, tl.trans(Kj), allow_tf32=False) * sm_scale # preventing tf32 to test accuracy w fp32 cpu execution
+            Sij = tl.dot(Qi, tl.trans(Kj), input_precision="ieee") * sm_scale # preventing tf32 to test accuracy w fp32 cpu execution
 
             # masking causal/out of bound indices
             j_idx = j_start + tl.arange(0, Bc)
-            valid = j_idx[None, :] < SEQLEN
+            valid = j_idx[None, :] < SEQLEN_K
             if is_causal:
-                i_idx = i_start + tl.arange(0, Br)
+                i_idx = i_start + causal_offset + tl.arange(0, Br)
                 valid = valid & (i_idx[:, None] >= j_idx[None, :])
 
             Sij = tl.where(valid, Sij, float("-inf"))
@@ -139,7 +138,7 @@ def fa2_forward(
             Pij = tl.exp(Sij - mij[:, None])
             rescale = tl.exp(mi - mij)
             li = rescale * li + tl.sum(Pij, axis=1)
-            Oi = rescale[:, None] * Oi + tl.dot(Pij, Vj, allow_tf32=False) # preventing tf32 to test accuracy w fp32 cpu execution
+            Oi = rescale[:, None] * Oi + tl.dot(Pij.to(Vj.dtype), Vj, input_precision="ieee") # preventing tf32 to test accuracy w fp32 cpu execution
 
             # update mi
             mi = mij
@@ -165,12 +164,13 @@ class FlashAttention2Function(torch.autograd.Function):
 
         # Bc = Br = 16
         batch_size, num_heads, seq_len, d = Q.shape
+        seq_len_k = K.shape[2]
         d_v = V.shape[-1]
         sm_scale = 1.0 / math.sqrt(d)
 
         assert Q.is_cuda and K.is_cuda and V.is_cuda, "Expected CUDA tensors"
-        assert Q.shape == K.shape, "Q and K are the same shape"
-        assert Q.shape[:-1] == V.shape[:-1], "Q and V are the same shape for all dimensions but the last"
+        assert Q.shape[:2] == K.shape[:2] and Q.shape[-1] == K.shape[-1], "Q and K match in batch, heads and head dim"
+        assert K.shape[:-1] == V.shape[:-1], "K and V are the same shape for all dimensions but the last"
         assert (d & (d - 1) == 0) and (d_v & (d_v - 1) == 0), "d and d_v must be powers of 2 (Triton block_shape constraint)"
 
         # initialize output tensors O & L
@@ -190,7 +190,7 @@ class FlashAttention2Function(torch.autograd.Function):
             L.stride(0), L.stride(1), L.stride(2),
             # Br=Br, Bc=Bc,
             d=d, d_v=d_v, 
-            is_causal=is_causal, SEQLEN=seq_len
+            is_causal=is_causal, SEQLEN_Q=seq_len, SEQLEN_K=seq_len_k,
         )
 
         # update context
