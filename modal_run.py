@@ -67,9 +67,9 @@ RESULTS_FILES = ["results.md", "concurrency_results.md"]
 
 
 @app.function(image=gpu_image, gpu=GPU, cloud=GPU_CLOUD, volumes={"/weights": weights, "/triton-cache": triton_cache}, timeout=3600)
-def run_benchmarks(scripts: list, description: str) -> dict:
+def run_benchmarks(scripts: list, description: str, tz: str) -> dict:
     """Run the given benchmark scripts on one GPU, back to back, and return the rows each results
-    file gained."""
+    file gained. tz: POSIX TZ string, so rows are timestamped in the caller's local time."""
     import os
     import shutil
     import subprocess
@@ -80,7 +80,7 @@ def run_benchmarks(scripts: list, description: str) -> dict:
     metrics = "/tmp/app/metrics"
     before = {f: len(open(f"{metrics}/{f}").readlines()) for f in RESULTS_FILES}
 
-    env = {**os.environ, "TRITON_CACHE_DIR": "/triton-cache"}
+    env = {**os.environ, "TRITON_CACHE_DIR": "/triton-cache", "TZ": tz}
     try:
         for script in scripts:
             print(f"\n===== {script} =====", flush=True)
@@ -88,6 +88,15 @@ def run_benchmarks(scripts: list, description: str) -> dict:
     finally:
         triton_cache.commit()
     return {f: open(f"{metrics}/{f}").readlines()[before[f]:] for f in RESULTS_FILES}
+
+
+def _local_tz():
+    """This machine's current UTC offset as a POSIX TZ string (e.g. "LOCAL7:00" for UTC-7). The
+    container's clock is UTC, and a fixed offset needs no timezone database there."""
+    import time
+
+    west = -time.localtime().tm_gmtoff  # POSIX offsets count hours west of UTC
+    return f"LOCAL{'-' if west < 0 else ''}{abs(west) // 3600}:{abs(west) % 3600 // 60:02d}"
 
 
 def _save_rows(new_rows, at_top):
@@ -110,10 +119,10 @@ def _save_rows(new_rows, at_top):
 @app.local_entrypoint()
 def benchmark(description: str):
     #   uv run modal run modal_run.py::benchmark --description "what changed"
-    _save_rows(run_benchmarks.remote(OURS, description), at_top=False)
+    _save_rows(run_benchmarks.remote(OURS, description, _local_tz()), at_top=False)
 
 
 @app.local_entrypoint()
 def baseline():
     #   uv run modal run modal_run.py::baseline   # HF transformers reference, run once per GPU
-    _save_rows(run_benchmarks.remote(HF_BASELINE, "A10G baseline, same dtype + KV budget"), at_top=True)
+    _save_rows(run_benchmarks.remote(HF_BASELINE, "baseline: same GPU, dtype and KV budget", _local_tz()), at_top=True)
