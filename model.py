@@ -47,9 +47,12 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        # normalize in fp32 even when running bf16 (as HF does), the mean of squares loses precision otherwise
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return x * self.weight
+        return self.weight * x.to(input_dtype)
 
 # RoPE functions
 def rotate_half(x):
@@ -93,18 +96,15 @@ class QwenAttention(torch.nn.Module):
         cache.write(layer_idx, slot_mapping, k, v)
         k, v = cache.read(layer_idx, gather_idx)
 
-        # grouped-query attention (GQA): repeat each kv head for its group of query heads
-        k = repeat_kv(k)
-        v = repeat_kv(v)
-
         # mask is None whenever every row is a plain (unpadded) causal sequence -- use the
-        # FA2 kernel (or SDPA's fused is_causal kernel) instead of an explicit attn_mask
+        # FA2 kernel (or SDPA's fused is_causal kernel) instead of an explicit attn_mask.
+        # FA2 handles GQA itself; SDPA needs each kv head repeated for its group of query heads
         if mask is None and FlashAttention2Function is not None and q.is_cuda:
             out = FlashAttention2Function.apply(q, k, v, is_causal)
         elif mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            out = F.scaled_dot_product_attention(q, repeat_kv(k), repeat_kv(v), is_causal=is_causal)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            out = F.scaled_dot_product_attention(q, repeat_kv(k), repeat_kv(v), attn_mask=mask)
         out = out.transpose(1, 2).reshape(B, T, NUM_HEADS * HEAD_DIM)
         return self.o_proj(out)
 

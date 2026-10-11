@@ -17,3 +17,13 @@
 | 2026-09-23 | 18:19:26 | ours | paged KV cache (16-tok blocks, same 896MB budget) | mps | 4 | 64 | 4 | 27.76 | 0.537 | 1.790 | 8.975 | 9.204 | 0.130 | 896 | 9.0 |
 | 2026-09-23 | 18:19:43 | ours | paged KV cache (16-tok blocks, same 896MB budget) | mps | 8 | 64 | 8 | 29.75 | 0.890 | 3.628 | 16.631 | 17.193 | 0.242 | 896 | 17.9 |
 | 2026-09-23 | 18:20:07 | ours | paged KV cache (16-tok blocks, same 896MB budget) | mps | 16 | 64 | 16 | 42.52 | 1.686 | 8.310 | 22.538 | 24.049 | 0.311 | 896 | 35.5 |
+| 2026-10-11 | 20:23:38 | ours | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 1 | 64 | 1 | 42.37 | 0.025 | 0.025 | 1.487 | 1.487 | 0.023 | 448 | 0.5 |
+| 2026-10-11 | 20:23:40 | ours | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 2 | 64 | 2 | 80.16 | 0.050 | 0.076 | 1.551 | 1.573 | 0.024 | 448 | 1.0 |
+| 2026-10-11 | 20:23:42 | ours | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 4 | 64 | 4 | 142.44 | 0.100 | 0.207 | 1.705 | 1.772 | 0.025 | 448 | 9.0 |
+| 2026-10-11 | 20:23:44 | ours | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 8 | 64 | 8 | 232.58 | 0.221 | 0.465 | 2.016 | 2.175 | 0.028 | 448 | 17.9 |
+| 2026-10-11 | 20:23:47 | ours | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 16 | 64 | 16 | 314.87 | 0.467 | 1.004 | 2.873 | 3.219 | 0.038 | 448 | 35.5 |
+| 2026-10-11 | 20:23:57 | HF transformers | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 1 | 64 | 1 | 43.00 | 0.024 | 0.024 | 1.488 | 1.488 | 0.023 | 448 | – |
+| 2026-10-11 | 20:23:58 | HF transformers | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 2 | 64 | 2 | 83.59 | 0.041 | 0.041 | 1.531 | 1.531 | 0.024 | 448 | – |
+| 2026-10-11 | 20:24:00 | HF transformers | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 4 | 64 | 4 | 159.72 | 0.086 | 0.086 | 1.603 | 1.603 | 0.024 | 448 | – |
+| 2026-10-11 | 20:24:01 | HF transformers | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 8 | 64 | 8 | 324.70 | 0.037 | 0.037 | 1.577 | 1.577 | 0.024 | 448 | – |
+| 2026-10-11 | 20:24:03 | HF transformers | A10G: FA2 kernel + paged KV cache + continuous batching | cuda NVIDIA A10 bf16 | 16 | 64 | 16 | 603.59 | 0.083 | 0.083 | 1.696 | 1.696 | 0.026 | 448 | – |

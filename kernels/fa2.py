@@ -4,26 +4,22 @@ import torch
 import math
 
 def get_configs():
-    configs = []
-    for Br in [16, 32, 64, 128]:
-        for Bc in [16, 32, 64, 128]:
-            for num_warps in [2, 4, 8]:
-                for num_stages in [2, 3, 4]:
-                    configs.append(
-                        triton.Config(
-                            {"Br": Br, "Bc": Bc},
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                        )
-                    )
-    return configs
+    # winners of a full 144-config search (Br, Bc in 16..128, 2-8 warps, 2-4 stages) on an A10G,
+    # bf16, head_dim 128. autotune just picks between them per key, re-run the full search on a new GPU
+    return [
+        triton.Config({"Br": 32, "Bc": 64}, num_warps=4, num_stages=2),  # prefill (causal)
+        triton.Config({"Br": 16, "Bc": 64}, num_warps=4, num_stages=3),  # decode (non-causal)
+    ]
 
 @triton.autotune(
     configs=get_configs(),
     key=["d", "d_v", "is_causal"],  # not seq lens: they change every decode step
+    cache_results=True,  # save the winning config to TRITON_CACHE_DIR so later runs skip tuning
 )
 
-@triton.jit
+# args that change with sequence length: without this, triton compiles a new variant whenever one
+# crosses a multiple of 16 (e.g. mid-decode), stalling that token for the length of a compile
+@triton.jit(do_not_specialize=["SEQLEN_Q", "SEQLEN_K", "Lb_stride", "Lh_stride"])
 def fa2_forward(
     # inputs
     Q_ptr, K_ptr, V_ptr,
@@ -39,6 +35,7 @@ def fa2_forward(
     Br: tl.constexpr, Bc: tl.constexpr, 
     d: tl.constexpr, d_v: tl.constexpr,
     is_causal: tl.constexpr, SEQLEN_Q, SEQLEN_K,
+    GROUP: tl.constexpr,  # query heads per kv head (GQA), 1 for plain MHA
 ):
     # program ids
     tile_id = tl.program_id(0)
@@ -50,8 +47,11 @@ def fa2_forward(
     # tl.device_print("head_id", head_id)
 
     q_offset = batch_id.to(tl.int64) * Qb_stride + head_id.to(tl.int64) * Qh_stride
-    k_offset = batch_id.to(tl.int64) * Kb_stride + head_id.to(tl.int64) * Kh_stride
-    v_offset = batch_id.to(tl.int64) * Vb_stride + head_id.to(tl.int64) * Vh_stride
+    
+    # GQA: each group of GROUP consecutive query heads reads the same kv head
+    kv_head_id = head_id // GROUP
+    k_offset = batch_id.to(tl.int64) * Kb_stride + kv_head_id.to(tl.int64) * Kh_stride
+    v_offset = batch_id.to(tl.int64) * Vb_stride + kv_head_id.to(tl.int64) * Vh_stride
 
     o_offset = batch_id.to(tl.int64) * Ob_stride + head_id.to(tl.int64) * Oh_stride 
     l_offset = batch_id.to(tl.int64) * Lb_stride + head_id.to(tl.int64) * Lh_stride 
@@ -169,7 +169,9 @@ class FlashAttention2Function(torch.autograd.Function):
         sm_scale = 1.0 / math.sqrt(d)
 
         assert Q.is_cuda and K.is_cuda and V.is_cuda, "Expected CUDA tensors"
-        assert Q.shape[:2] == K.shape[:2] and Q.shape[-1] == K.shape[-1], "Q and K match in batch, heads and head dim"
+        num_kv_heads = K.shape[1]
+        assert Q.shape[0] == K.shape[0] and Q.shape[-1] == K.shape[-1], "Q and K match in batch and head dim"
+        assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
         assert K.shape[:-1] == V.shape[:-1], "K and V are the same shape for all dimensions but the last"
         assert (d & (d - 1) == 0) and (d_v & (d_v - 1) == 0), "d and d_v must be powers of 2 (Triton block_shape constraint)"
 
@@ -191,6 +193,7 @@ class FlashAttention2Function(torch.autograd.Function):
             # Br=Br, Bc=Bc,
             d=d, d_v=d_v, 
             is_causal=is_causal, SEQLEN_Q=seq_len, SEQLEN_K=seq_len_k,
+            GROUP=num_heads // num_kv_heads,
         )
 
         # update context

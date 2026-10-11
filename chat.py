@@ -30,7 +30,10 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-KV_CACHE = KVCache(KV_CACHE_TOKENS // BLOCK_SIZE, BLOCK_SIZE, DEVICE, dtype=torch.float32)
+# bf16 on CUDA (what the FA2 kernel is tuned for), fp32 elsewhere to keep mps results comparable
+DTYPE = torch.bfloat16 if DEVICE.type == "cuda" else torch.float32
+
+KV_CACHE = KVCache(KV_CACHE_TOKENS // BLOCK_SIZE, BLOCK_SIZE, DEVICE, dtype=DTYPE)
 
 
 def load_qwen(model_path):
@@ -39,7 +42,7 @@ def load_qwen(model_path):
     state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     model.eval()
-    return model.to(DEVICE)
+    return model.to(DEVICE, dtype=DTYPE)
 
 
 STOP_SEQUENCES = ["\nUser:", "\nUser"]  # model hallucinating the next turn instead of ending its own

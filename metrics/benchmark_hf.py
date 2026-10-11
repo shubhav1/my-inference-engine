@@ -1,29 +1,27 @@
-"""Same benchmark as benchmark.py, but running the official HuggingFace transformers
-implementation of Qwen2.5-1.5B instead of our own model.py for a good point of comparison."""
-import sys
-import time
-from pathlib import Path
+"""Same benchmark as benchmark.py, but running the official HuggingFace transformers implementation
+of Qwen2.5-1.5B (same dtype and device as our engine) instead of our own model.py, as a baseline.
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # chat.py lives one level up
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # benchmark.py lives alongside this file
-
+    python metrics/benchmark_hf.py "what changed since the last run"
+"""
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from benchmark import NUM_TOKENS, PROMPT, write_results
-from chat import DEVICE, MODEL_PATH, TEMPERATURE
+from common import device_label, get_description
+from benchmark import NUM_TOKENS, PROMPT, report, time_generation, write_results
+from chat import DEVICE, DTYPE, MODEL_PATH, TEMPERATURE
+
 
 def load_hf():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=DTYPE)
     model.eval()
     return model.to(DEVICE), tokenizer
 
 
 def generate(model, input_ids, max_tokens):
-    """Mirrors chat.generate(): feed the prompt once, then one new token per step, using
-    HF's own KV cache (past_key_values). Same sampling recipe as our engine -- softmax at
-    TEMPERATURE, then multinomial, no top-k/top-p truncation -- for a like-for-like comparison.
+    """Mirrors chat.generate(): feed the prompt once, then one new token per step, using HF's own
+    KV cache (past_key_values). Same sampling recipe as our engine -- softmax at TEMPERATURE, then
+    multinomial, no top-k/top-p truncation -- for a like-for-like comparison.
     """
     next_ids = input_ids
     past_key_values = None
@@ -37,48 +35,21 @@ def generate(model, input_ids, max_tokens):
         yield next_id.item()
 
 
-def warmup(model, tokenizer):
-    ids = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
-    for _ in generate(model, ids, max_tokens=1):
-        pass
-
-
-def run_benchmark(model, tokenizer):
-    ids = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
-
-    token_times = []
-    start = time.perf_counter()
-    prev = start
-    for _ in generate(model, ids, max_tokens=NUM_TOKENS):
-        now = time.perf_counter()
-        token_times.append(now - prev)
-        prev = now
-    total_time = time.perf_counter() - start
-
-    ttft = token_times[0]
-    tpot = sum(token_times[1:]) / (len(token_times) - 1) if len(token_times) > 1 else 0.0
-    throughput = len(token_times) / total_time
-    return ttft, tpot, throughput
-
-
 def main():
-    description = input("Describe this run: ").strip()
+    description = get_description()
 
     print("loading HF tokenizer and model...")
     model, tokenizer = load_hf()
+    ids = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
 
     print("warming up...")
-    warmup(model, tokenizer)
+    for _ in generate(model, ids, max_tokens=2):
+        pass
 
-    print(f"benchmarking {NUM_TOKENS} tokens on {DEVICE.type} (HuggingFace transformers)...")
-    ttft, tpot, throughput = run_benchmark(model, tokenizer)
-
-    print(f"time to first token: {ttft:.3f}s")
-    print(f"time per output token: {tpot:.3f}s")
-    print(f"throughput: {throughput:.2f} tokens/sec")
-
-    write_results(f"[HF transformers] {description}", ttft, tpot, throughput)
-    print(f"results appended to {Path(__file__).resolve().parent / 'results.md'}")
+    print(f"benchmarking {NUM_TOKENS} tokens on {device_label()} (HuggingFace transformers)...")
+    results = time_generation(generate(model, ids, max_tokens=NUM_TOKENS))
+    report(*results)
+    write_results(f"[HF transformers] {description}", *results)
 
 
 if __name__ == "__main__":

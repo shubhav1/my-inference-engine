@@ -1,23 +1,23 @@
+"""Concurrency benchmark: drives the real scheduler in chat.py (admission, deferral, batched decode)
+with N chats that all send their first message at the same moment, then measures aggregate
+throughput, latency and how much of the KV cache is actually in use. Sweeping N up shows where
+chats start queuing for cache capacity rather than running concurrently.
+benchmark_concurrency_hf.py runs the same workload through HF transformers' continuous batching.
+
+    python metrics/benchmark_concurrency.py "what changed since the last run"
+"""
 import statistics
-import sys
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # chat.py/tokenizer.py live one level up
-
+from common import device_label, get_description, timestamp
 import chat as engine
-from chat import DEVICE, KV_CACHE, MODEL_PATH, Chat, load_qwen
+from chat import KV_CACHE, MODEL_PATH, Chat, load_qwen
 from tokenizer import QwenTokenizer
 
-# Drives the real scheduler in chat.py (admission, deferral, batched decode) with N chats that
-# all send their first message at the same moment, then measures aggregate throughput, latency
-# and how much of the KV cache is actually in use. Sweeping N up shows where chats start
-# queuing for cache capacity rather than running concurrently.
-# benchmark_concurrency_hf.py runs the same workload through HF transformers' continuous batching.
 CONCURRENCY_LEVELS = [1, 2, 4, 8, 16]
 REPLY_TOKENS = 64  # every reply runs exactly this many tokens (EOS and stop sequences disabled)
 NO_EOS = -1  # no real token id is negative, so a reply never ends early on EOS
@@ -25,7 +25,7 @@ SEED = 0
 SAMPLE_INTERVAL = 0.01  # seconds between samples of scheduler / cache occupancy
 RESULTS_FILE = Path(__file__).resolve().parent / "concurrency_results.md"
 
-# KV cache memory budget both engines get: whatever our static cache reserves
+# KV cache memory budget both engines get: whatever our paged cache's pool reserves
 KV_BYTES_PER_TOKEN = KV_CACHE.buf[:, :, 0].numel() * KV_CACHE.buf.element_size()
 KV_RESERVED_MB = KV_CACHE.buf.numel() * KV_CACHE.buf.element_size() / 2**20
 
@@ -92,14 +92,10 @@ def print_row(r):
 
 def write_row(engine_name, description, r):
     # the header and table columns live in RESULTS_FILE already, this only appends a row
-    description = description.replace("|", "/").replace("\n", " ")
-    now = datetime.now()
     kv = f"{r['kv_util']:.1f}" if r["kv_util"] is not None else "–"
-
     with open(RESULTS_FILE, "a") as f:
         f.write(
-            f"| {now.strftime('%Y-%m-%d')} | {now.strftime('%H:%M:%S')} | {engine_name} | {description} | "
-            f"{DEVICE.type} | {r['n']} | {REPLY_TOKENS} | {r['peak_active']} | {r['throughput']:.2f} | "
+            f"| {timestamp()} | {engine_name} | {description} | {device_label()} | {r['n']} | {REPLY_TOKENS} | {r['peak_active']} | {r['throughput']:.2f} | "
             f"{r['ttft_p50']:.3f} | {r['ttft_p99']:.3f} | {r['lat_p50']:.3f} | {r['lat_p99']:.3f} | "
             f"{r['tpot']:.3f} | {KV_RESERVED_MB:.0f} | {kv} |\n"
         )
@@ -186,7 +182,7 @@ def run_level(model, tokenizer, n):
 
 
 def warmup(model, tokenizer):
-    engine.MAX_REPLY_TOKENS = 2
+    engine.MAX_REPLY_TOKENS = 2  # the worker reads this module global on every step
     chat = Chat(tokenizer)
     chat.eos_id = NO_EOS
     for _ in chat.send_stream(model, PROMPTS[0]):
@@ -194,10 +190,11 @@ def warmup(model, tokenizer):
     chat.release()
     _first_token_at.clear()
     _last_token_at.clear()
+    engine.MAX_REPLY_TOKENS = REPLY_TOKENS
 
 
 def main():
-    description = input("Describe this run: ").strip()
+    description = get_description()
 
     print("loading tokenizer and model...")
     tokenizer = QwenTokenizer(MODEL_PATH)
@@ -207,10 +204,9 @@ def main():
 
     print("warming up...")
     warmup(model, tokenizer)
-    engine.MAX_REPLY_TOKENS = REPLY_TOKENS  # the worker reads this module global on every step
 
     for n in CONCURRENCY_LEVELS:
-        print(f"running {n} concurrent chat(s) on {DEVICE.type}...")
+        print(f"running {n} concurrent chat(s) on {device_label()}...")
         r = run_level(model, tokenizer, n)
         print_row(r)
         write_row("ours", description, r)  # append as each level finishes, so a partial sweep still lands

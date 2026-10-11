@@ -1,31 +1,31 @@
 """Same workload as benchmark_concurrency.py, but served by HuggingFace transformers' own
 continuous batching engine (paged KV cache, no fixed slot count) instead of our chat.py
-scheduler, for a like-for-like comparison of throughput, TTFT and latency at N concurrent chats."""
-import sys
-import time
-from pathlib import Path
+scheduler, for a like-for-like comparison of throughput, TTFT and latency at N concurrent chats.
+Same dtype, device and KV memory budget as our engine.
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # chat.py lives one level up
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # benchmark_concurrency.py lives alongside this file
+    python metrics/benchmark_concurrency_hf.py "what changed since the last run"
+"""
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from transformers.generation.configuration_utils import ContinuousBatchingConfig
 
+from common import device_label, get_description
 from benchmark_concurrency import (
     CONCURRENCY_LEVELS, KV_BYTES_PER_TOKEN, KV_RESERVED_MB, NO_EOS, REPLY_TOKENS, RESULTS_FILE, SEED,
     print_row, prompt_text, summarize, write_row,
 )
-from chat import DEVICE, MODEL_PATH, TEMPERATURE
+from chat import DEVICE, DTYPE, MODEL_PATH, TEMPERATURE
 
-# same KV memory budget as our static cache, split into HF's paged blocks
+# same KV memory budget as our paged cache, split into HF's own (larger) blocks
 BLOCK_SIZE = 256
 NUM_BLOCKS = int(KV_RESERVED_MB * 2**20) // (BLOCK_SIZE * KV_BYTES_PER_TOKEN)
 
 
 def load_hf():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.float32, attn_implementation="sdpa")
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=DTYPE, attn_implementation="sdpa")
     model.eval()
     return model.to(DEVICE), tokenizer
 
@@ -82,7 +82,7 @@ def run_level(manager, tokenizer, n):
 
 
 def main():
-    description = input("Describe this run: ").strip()
+    description = get_description()
 
     print("loading HF tokenizer and model...")
     model, tokenizer = load_hf()
@@ -94,7 +94,7 @@ def main():
 
     try:
         for n in CONCURRENCY_LEVELS:
-            print(f"running {n} concurrent request(s) on {DEVICE.type} (HuggingFace transformers)...")
+            print(f"running {n} concurrent request(s) on {device_label()} (HuggingFace transformers)...")
             r = run_level(manager, tokenizer, n)
             print_row(r)
             write_row("HF transformers", description, r)  # append as each level finishes
