@@ -1,7 +1,8 @@
 # Run the engine on a Modal GPU. Weights fetched once and stored in Modal Volume.
 # uv run modal run modal_run.py::download_weights   # one-time: pull Qwen2.5-1.5B into the volume
 # uv run modal run modal_run.py::test_fa2           # FA2 kernel vs SDPA correctness check
-# uv run modal run modal_run.py::benchmark --description "..."  # all 4 benchmarks, rows land in metrics/*.md
+# uv run modal run modal_run.py::benchmark --description "..."  # our engine, rows appended to metrics/*.md
+# uv run modal run modal_run.py::baseline          # HF reference, rows go at the top of metrics/*.md
 
 import modal
 
@@ -11,6 +12,11 @@ weights = modal.Volume.from_name("qwen-weights", create_if_missing=True)
 triton_cache = modal.Volume.from_name("triton-cache", create_if_missing=True)
 
 WEIGHTS_DIR = "/weights/qwen2.5-1.5b"
+
+# pinned so every run lands on the same hardware: unpinned, "A10G" can be served by other clouds'
+# NVIDIA A10 (different card + host CPU), which moved results by ~25% between runs
+GPU = "A10G"
+GPU_CLOUD = "aws"
 
 
 @app.function(
@@ -43,7 +49,7 @@ gpu_image = (
 )
 
 
-@app.function(image=gpu_image, gpu="A10G", volumes={"/triton-cache": triton_cache}, timeout=3600)
+@app.function(image=gpu_image, gpu=GPU, cloud=GPU_CLOUD, volumes={"/triton-cache": triton_cache}, timeout=3600)
 def test_fa2():
     import os
     import subprocess
@@ -55,14 +61,15 @@ def test_fa2():
         triton_cache.commit()
 
 
-BENCHMARKS = ["benchmark.py", "benchmark_hf.py", "benchmark_concurrency.py", "benchmark_concurrency_hf.py"]
+OURS = ["benchmark.py", "benchmark_concurrency.py"]
+HF_BASELINE = ["benchmark_hf.py", "benchmark_concurrency_hf.py"]
 RESULTS_FILES = ["results.md", "concurrency_results.md"]
 
 
-@app.function(image=gpu_image, gpu="A10G", volumes={"/weights": weights, "/triton-cache": triton_cache}, timeout=3600)
-def run_benchmarks(description: str) -> dict:
-    """Run every benchmark (ours and HF, single chat and concurrent) on one GPU, back to back, and
-    return the rows each results file gained."""
+@app.function(image=gpu_image, gpu=GPU, cloud=GPU_CLOUD, volumes={"/weights": weights, "/triton-cache": triton_cache}, timeout=3600)
+def run_benchmarks(scripts: list, description: str) -> dict:
+    """Run the given benchmark scripts on one GPU, back to back, and return the rows each results
+    file gained."""
     import os
     import shutil
     import subprocess
@@ -75,7 +82,7 @@ def run_benchmarks(description: str) -> dict:
 
     env = {**os.environ, "TRITON_CACHE_DIR": "/triton-cache"}
     try:
-        for script in BENCHMARKS:
+        for script in scripts:
             print(f"\n===== {script} =====", flush=True)
             subprocess.run(["python", f"metrics/{script}", description], cwd="/tmp/app", env=env, check=True)
     finally:
@@ -83,15 +90,30 @@ def run_benchmarks(description: str) -> dict:
     return {f: open(f"{metrics}/{f}").readlines()[before[f]:] for f in RESULTS_FILES}
 
 
+def _save_rows(new_rows, at_top):
+    """Add each file's new rows locally: appended, or right under the table header (baseline)."""
+    from pathlib import Path
+
+    for name, rows in new_rows.items():
+        path = Path(__file__).parent / "metrics" / name
+        lines = path.read_text().splitlines(keepends=True)
+        if at_top:
+            header_end = next(i for i, line in enumerate(lines) if line.startswith("|---")) + 1
+            lines[header_end:header_end] = rows
+        else:
+            lines += rows
+        path.write_text("".join(lines))
+        print(f"\n{len(rows)} new row(s) {'at the top of' if at_top else 'appended to'} {path}:")
+        print("".join(rows), end="")
+
+
 @app.local_entrypoint()
 def benchmark(description: str):
     #   uv run modal run modal_run.py::benchmark --description "what changed"
-    from pathlib import Path
+    _save_rows(run_benchmarks.remote(OURS, description), at_top=False)
 
-    new_rows = run_benchmarks.remote(description)
-    for name, rows in new_rows.items():
-        path = Path(__file__).parent / "metrics" / name
-        with open(path, "a") as f:
-            f.writelines(rows)
-        print(f"\n{len(rows)} new row(s) appended to {path}:")
-        print("".join(rows), end="")
+
+@app.local_entrypoint()
+def baseline():
+    #   uv run modal run modal_run.py::baseline   # HF transformers reference, run once per GPU
+    _save_rows(run_benchmarks.remote(HF_BASELINE, "A10G baseline, same dtype + KV budget"), at_top=True)

@@ -82,7 +82,7 @@ def generate(model, new_ids, eos_id, max_tokens=MAX_REPLY_TOKENS):
             input_id = torch.tensor([next_id] if is_first else [[next_id]], device=DEVICE)
             is_first = False
             logits = model(input_id, cache, [seq])
-        next_id = _sample(logits[0, -1])
+        next_id = _sample(logits[:, -1])[0]
         yield next_id
         if next_id == eos_id:
             break
@@ -100,9 +100,11 @@ class _Job:
         self.new_ids = chat.tokenizer.encode(f"User: {text}\nAssistant:")
 
 
-def _sample(logit_row):
-    probs = F.softmax(logit_row / TEMPERATURE, dim=-1)
-    return torch.multinomial(probs, num_samples=1).item()
+def _sample(logits):
+    """One token id per row of [B, vocab] logits, each row sampled independently. Batched so a
+    decode step pays a single device sync for every active chat, not one per chat."""
+    probs = F.softmax(logits / TEMPERATURE, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(1).tolist()
 
 
 _job_queue = queue.Queue()
@@ -169,16 +171,16 @@ def _admit(job):
     if chat.seq is None:
         # first message, or this chat's cache was evicted while idle: prefill its whole history
         chat.seq = KV_CACHE.alloc()
-        prefill_ids = chat.ids
-    else:
-        prefill_ids = job.new_ids
+    # everything in chat.ids the cache doesn't hold yet: this message, plus the previous reply's
+    # last token and trailing "\n" that _finish() leaves for this prefill to write
+    prefill_ids = chat.ids[KV_CACHE.length(chat.seq):]
     KV_CACHE.ensure_capacity(chat.seq, reserve_len)  # _make_room() already checked these are free
     _touch(chat)
 
     input_ids = torch.tensor([prefill_ids], device=DEVICE)
     with torch.no_grad():
         logits = model(input_ids, KV_CACHE, [chat.seq])
-    job.next_token = _sample(logits[0, -1])
+    job.next_token = _sample(logits[:, -1])[0]
 
     active.append(job)
 
@@ -191,13 +193,11 @@ def _emit(job, piece):
 
 def _finish(job):
     chat = job.chat
-    trailing = chat.tokenizer.encode("\n")
-    # the reply's last token was appended to chat.ids but never fed back through the model,
-    # so write it into the cache together with the trailing "\n"
-    tail = chat.ids[-1:] + trailing
-    chat.ids.extend(trailing)
-    with torch.no_grad():
-        job.model(torch.tensor([tail], device=DEVICE), KV_CACHE, [chat.seq])
+    # the reply's last token was appended to chat.ids but never fed back through the model. It
+    # and the trailing "\n" are left out of the cache on purpose: the chat's next prefill writes
+    # them along with its new message (see _admit), instead of a separate forward pass per reply
+    # that would stall every other active chat
+    chat.ids.extend(chat.tokenizer.encode("\n"))
     # the cache is NOT freed here -- the conversation continues across turns -- but blocks
     # reserved for reply tokens that were never generated go back to the pool
     with _cache_lock:
@@ -304,8 +304,8 @@ def _process(active):
     with torch.no_grad():
         logits = model(input_ids, KV_CACHE, seqs)
 
-    for i, job in enumerate(continuing):
-        job.next_token = _sample(logits[i, -1])
+    for job, token_id in zip(continuing, _sample(logits[:, -1])):
+        job.next_token = token_id
 
 
 threading.Thread(target=_worker, daemon=True).start()

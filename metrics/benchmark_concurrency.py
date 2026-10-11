@@ -2,17 +2,13 @@
 with N chats that all send their first message at the same moment, then measures aggregate
 throughput, latency and how much of the KV cache is actually in use. Sweeping N up shows where
 chats start queuing for cache capacity rather than running concurrently.
-benchmark_concurrency_hf.py runs the same workload through HF transformers' continuous batching.
+benchmark_concurrency_hf.py runs the same workload through HF transformers' continuous batching."""
 
-    python metrics/benchmark_concurrency.py "what changed since the last run"
-"""
 import statistics
 import threading
 import time
 from pathlib import Path
-
 import torch
-
 from common import device_label, get_description, timestamp
 import chat as engine
 from chat import KV_CACHE, MODEL_PATH, Chat, load_qwen
@@ -110,7 +106,7 @@ _last_token_at = {}  # chat -> time its reply finished generating
 def _instrument_engine():
     """Timestamp the scheduler's own events so TTFT / latency mean the same thing as the HF
     run's per-token timestamps: first token = right after prefill samples it, last token = when
-    the worker retires the job (before its bookkeeping-only trailing "\\n" forward pass)."""
+    the worker retires the job."""
     admit, finish = engine._admit, engine._finish
 
     def timed_admit(job):

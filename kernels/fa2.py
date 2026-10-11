@@ -27,6 +27,7 @@ def fa2_forward(
     Kb_stride, Kh_stride, Ks_stride, Kd_stride,
     Vb_stride, Vh_stride, Vs_stride, Vd_stride,
     sm_scale,
+    KV_lens_ptr,  # [batch] int32: valid keys per row, keys past it are padding (ragged batches)
     # ouputs
     O_ptr, L_ptr,
     Ob_stride, Oh_stride, Os_stride, Od_stride,
@@ -102,8 +103,11 @@ def fa2_forward(
     )
 
     i_start = tile_id * Br
-    # causal mask is bottom-right aligned: query i sits at key position i + causal_offset
-    causal_offset = SEQLEN_K - SEQLEN_Q
+    # this row's own key count: K/V are padded to SEQLEN_K across the batch, only kv_len are real
+    kv_len = tl.load(KV_lens_ptr + batch_id)
+
+    # causal mask is bottom-right aligned per row: query i sits at key position i + causal_offset
+    causal_offset = kv_len - SEQLEN_Q
     i_end = tl.minimum(i_start + Br, SEQLEN_Q) + causal_offset
 
     # load Qi from HBM to SRAM
@@ -115,7 +119,7 @@ def fa2_forward(
     mi = tl.full((Br,), float('-inf'), dtype=tl.float32)
 
     #j_max = SEQLEN if not is_causal else i_end
-    for j_start in range(0, SEQLEN_K, Bc):
+    for j_start in range(0, kv_len, Bc):
         if not is_causal or (i_end > j_start):
             # load Kj, Vj from HBM to SRAM
             Kj = tl.load(K_block_ptr, boundary_check = (0,1))
@@ -126,7 +130,7 @@ def fa2_forward(
 
             # masking causal/out of bound indices
             j_idx = j_start + tl.arange(0, Bc)
-            valid = j_idx[None, :] < SEQLEN_K
+            valid = j_idx[None, :] < kv_len
             if is_causal:
                 i_idx = i_start + causal_offset + tl.arange(0, Br)
                 valid = valid & (i_idx[:, None] >= j_idx[None, :])
@@ -159,7 +163,9 @@ def fa2_forward(
 
 class FlashAttention2Function(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, is_causal = False):
+    def forward(ctx, Q, K, V, is_causal = False, kv_lens = None):
+        # kv_lens: optional [batch] valid key count per row, for batches whose K/V are padded to
+        # different lengths. Defaults to every row using all of K/V
         # calls fa2 forward triton function
 
         # Bc = Br = 16
@@ -173,6 +179,9 @@ class FlashAttention2Function(torch.autograd.Function):
         assert Q.shape[0] == K.shape[0] and Q.shape[-1] == K.shape[-1], "Q and K match in batch and head dim"
         assert num_heads % num_kv_heads == 0, "num_heads must be a multiple of num_kv_heads (GQA)"
         assert K.shape[:-1] == V.shape[:-1], "K and V are the same shape for all dimensions but the last"
+        if kv_lens is None:
+            kv_lens = torch.full((batch_size,), seq_len_k, device=Q.device, dtype=torch.int32)
+        assert kv_lens.shape == (batch_size,) and kv_lens.dtype == torch.int32, "kv_lens is [batch] int32"
         assert (d & (d - 1) == 0) and (d_v & (d_v - 1) == 0), "d and d_v must be powers of 2 (Triton block_shape constraint)"
 
         # initialize output tensors O & L
@@ -187,6 +196,7 @@ class FlashAttention2Function(torch.autograd.Function):
             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
             V.stride(0), V.stride(1), V.stride(2), V.stride(3),
             sm_scale,
+            kv_lens,
             O, L,
             O.stride(0), O.stride(1), O.stride(2), O.stride(3),
             L.stride(0), L.stride(1), L.stride(2),

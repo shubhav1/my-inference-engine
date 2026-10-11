@@ -83,7 +83,7 @@ class QwenAttention(torch.nn.Module):
         self.v_proj = torch.nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=True)
         self.o_proj = torch.nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
 
-    def forward(self, x, cos, sin, mask, is_causal, cache, layer_idx, slot_mapping, gather_idx):
+    def forward(self, x, cos, sin, mask, is_causal, kv_lens, cache, layer_idx, slot_mapping, gather_idx):
         B, T, _ = x.shape
         q = self.q_proj(x).view(B, T, NUM_HEADS, HEAD_DIM).transpose(1, 2)
         k = self.k_proj(x).view(B, T, NUM_KV_HEADS, HEAD_DIM).transpose(1, 2)
@@ -92,15 +92,15 @@ class QwenAttention(torch.nn.Module):
         q, k = apply_rope(q, k, cos, sin)
 
         # scatter this step's new k/v into their blocks in the paged cache, then gather every
-        # position so far back into a dense [B, kv_heads, S, head_dim] tensor for SDPA
+        # position so far back into a dense [B, kv_heads, S, head_dim] tensor
         cache.write(layer_idx, slot_mapping, k, v)
         k, v = cache.read(layer_idx, gather_idx)
 
-        # mask is None whenever every row is a plain (unpadded) causal sequence -- use the
-        # FA2 kernel (or SDPA's fused is_causal kernel) instead of an explicit attn_mask.
+        # FA2 masks each row to its own kv_lens itself, so it handles ragged batches too. On the
+        # SDPA fallback, mask is None whenever every row is a plain (unpadded) causal sequence.
         # FA2 handles GQA itself; SDPA needs each kv head repeated for its group of query heads
-        if mask is None and FlashAttention2Function is not None and q.is_cuda:
-            out = FlashAttention2Function.apply(q, k, v, is_causal)
+        if FlashAttention2Function is not None and q.is_cuda:
+            out = FlashAttention2Function.apply(q, k, v, is_causal, kv_lens)
         elif mask is None:
             out = F.scaled_dot_product_attention(q, repeat_kv(k), repeat_kv(v), is_causal=is_causal)
         else:
@@ -128,9 +128,9 @@ class QwenBlock(torch.nn.Module):
         self.post_attention_layernorm = RMSNorm(HIDDEN_SIZE, RMS_NORM_EPS)
         self.mlp = QwenMLP()
 
-    def forward(self, x, cos, sin, mask, is_causal, cache, layer_idx, slot_mapping, gather_idx):
+    def forward(self, x, cos, sin, mask, is_causal, kv_lens, cache, layer_idx, slot_mapping, gather_idx):
         attention_output = self.self_attn(
-            self.input_layernorm(x), cos, sin, mask, is_causal,
+            self.input_layernorm(x), cos, sin, mask, is_causal, kv_lens,
             cache, layer_idx, slot_mapping, gather_idx,
         )
         x = x + attention_output
@@ -157,6 +157,7 @@ class Qwen2ForCausalLM(torch.nn.Module):
     def forward(self, input_ids, cache, seqs):
         """input_ids: [B, T]. cache: a KVCache. seqs: that cache's sequence id for each batch
         item (list[int]), every row's prior length is tracked by the cache itself.
+        Returns logits for each row's last position only: [B, 1, vocab].
         """
         _, T = input_ids.shape
         x = self.embed_tokens(input_ids)
@@ -170,12 +171,19 @@ class Qwen2ForCausalLM(torch.nn.Module):
         position_ids = starts[:, None] + torch.arange(T, device=x.device)[None, :]
         cos, sin = self.rope_cos_sin(position_ids, x.dtype)
 
-        # skip building an explicit mask when every row shares the same start, SDPA's
+        # every row's valid key count once this step is written: FA2 masks padding past it
+        kv_lens = (starts + T).to(torch.int32)
+
+        # FA2 needs no explicit mask: each row is masked to its own kv_lens, bottom-right causal.
+        # SDPA can skip building one when every row shares the same start, its
         # fused is_causal kernel is exact then (True only for a fresh prefill; PyTorch's
         # is_causal is top-left aligned, so a T==1 decode step needs mask=None instead)
         same_start = all(s == starts_list[0] for s in starts_list)
         c0 = starts_list[0]
-        if same_start and (T == 1 or c0 == 0):
+        if FlashAttention2Function is not None and x.is_cuda:
+            mask = None
+            is_causal = T > 1  # a single query row (decode) sees every key up to kv_lens anyway
+        elif same_start and (T == 1 or c0 == 0):
             mask = None
             is_causal = (c0 == 0)
         else:
@@ -188,11 +196,12 @@ class Qwen2ForCausalLM(torch.nn.Module):
 
         # run every layer, each writing this step's k/v into the cache as it goes
         for layer_idx, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, mask, is_causal, cache, layer_idx, slot_mapping, gather_idx)
+            x = layer(x, cos, sin, mask, is_causal, kv_lens, cache, layer_idx, slot_mapping, gather_idx)
 
         # advance every row's length once, now that all layers have written this step
         cache.advance(seqs, T)
 
-        x = self.norm(x)
+        # only the last position's logits are ever sampled from, dont need to calculate every token's logits
+        x = self.norm(x[:, -1:])
         logits = x @ self.embed_tokens.weight.T
         return logits
